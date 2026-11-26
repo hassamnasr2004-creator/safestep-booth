@@ -1,27 +1,37 @@
-// Real Web Audio API emergency siren + short chimes + Vibration + Push Notification helper
+// Persistent Web Audio API Alarm Engine (never mutes on 2nd/3rd/10th trigger) + Vibration + Push
 
-let audioCtx: AudioContext | null = null;
-let alarmIntervalId: number | null = null;
+let persistentAudioCtx: AudioContext | null = null;
+let sirenIntervalId: number | null = null;
 let vibrateIntervalId: number | null = null;
 
-function ensureAudioContext(): AudioContext | null {
+function getOrCreateAudioContext(): AudioContext | null {
   if (typeof window === 'undefined') return null;
-  if (!audioCtx) {
+  if (!persistentAudioCtx) {
     const AudioCtx =
       window.AudioContext ||
       (window as unknown as { webkitAudioContext?: typeof AudioContext })
         .webkitAudioContext;
     if (AudioCtx) {
-      audioCtx = new AudioCtx();
+      persistentAudioCtx = new AudioCtx();
     }
   }
-  if (audioCtx && audioCtx.state === 'suspended') {
-    audioCtx.resume().catch(() => {});
-  }
-  return audioCtx;
+  return persistentAudioCtx;
 }
 
-function playTone(
+async function ensureResumedContext(): Promise<AudioContext | null> {
+  const ctx = getOrCreateAudioContext();
+  if (!ctx) return null;
+  if (ctx.state === 'suspended') {
+    try {
+      await ctx.resume();
+    } catch {
+      // Browser may block until gesture
+    }
+  }
+  return ctx;
+}
+
+function scheduleTone(
   ctx: AudioContext,
   freq: number,
   startOffset: number,
@@ -29,34 +39,31 @@ function playTone(
   volume: number,
   type: OscillatorType = 'sine'
 ) {
+  const now = ctx.currentTime;
   const osc = ctx.createOscillator();
   const gain = ctx.createGain();
   osc.type = type;
-  osc.frequency.setValueAtTime(freq, ctx.currentTime + startOffset);
-  gain.gain.setValueAtTime(0.0001, ctx.currentTime + startOffset);
-  gain.gain.exponentialRampToValueAtTime(volume, ctx.currentTime + startOffset + 0.015);
-  gain.gain.exponentialRampToValueAtTime(
-    0.0001,
-    ctx.currentTime + startOffset + duration
-  );
+  osc.frequency.setValueAtTime(freq, now + startOffset);
+  gain.gain.setValueAtTime(0.0001, now + startOffset);
+  gain.gain.exponentialRampToValueAtTime(volume, now + startOffset + 0.015);
+  gain.gain.exponentialRampToValueAtTime(0.0001, now + startOffset + duration);
   osc.connect(gain);
   gain.connect(ctx.destination);
-  osc.start(ctx.currentTime + startOffset);
-  osc.stop(ctx.currentTime + startOffset + duration + 0.02);
+  osc.start(now + startOffset);
+  osc.stop(now + startOffset + duration + 0.025);
 }
 
-// Call on user tap ("تفعيل تنبيهات الهاتف والصوت") to unlock iOS/Android Web Audio + Notification + Vibration
+// Unlock persistent AudioContext + Notification + Vibration on first user tap
 export async function unlockPhoneAlerts(): Promise<{
   audioUnlocked: boolean;
   notificationPermission: NotificationPermission | 'unsupported';
 }> {
-  const ctx = ensureAudioContext();
+  const ctx = await ensureResumedContext();
   let audioUnlocked = false;
   if (ctx) {
     try {
-      await ctx.resume();
-      playTone(ctx, 660, 0, 0.09, 0.14, 'sine');
-      playTone(ctx, 880, 0.1, 0.12, 0.14, 'sine');
+      scheduleTone(ctx, 660, 0, 0.08, 0.14, 'sine');
+      scheduleTone(ctx, 880, 0.09, 0.11, 0.14, 'sine');
       audioUnlocked = true;
     } catch {
       audioUnlocked = false;
@@ -65,13 +72,14 @@ export async function unlockPhoneAlerts(): Promise<{
 
   if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
     try {
-      navigator.vibrate(120);
+      navigator.vibrate(100);
     } catch {
-      // Ignore unsupported vibrate
+      // Ignore
     }
   }
 
-  let notificationPermission: NotificationPermission | 'unsupported' = 'unsupported';
+  let notificationPermission: NotificationPermission | 'unsupported' =
+    'unsupported';
   if (typeof window !== 'undefined' && 'Notification' in window) {
     if (Notification.permission === 'granted') {
       notificationPermission = 'granted';
@@ -89,55 +97,59 @@ export async function unlockPhoneAlerts(): Promise<{
   return { audioUnlocked, notificationPermission };
 }
 
-export function playShortChime(kind: 'lock' | 'unlock' | 'denied'): void {
-  const ctx = ensureAudioContext();
+export async function playShortChime(
+  kind: 'lock' | 'unlock' | 'denied' | 'step'
+): Promise<void> {
+  const ctx = await ensureResumedContext();
   if (!ctx) return;
   try {
     if (kind === 'lock') {
-      playTone(ctx, 523.25, 0, 0.09, 0.14, 'sine');
-      playTone(ctx, 783.99, 0.1, 0.16, 0.15, 'sine');
+      scheduleTone(ctx, 523.25, 0, 0.09, 0.14, 'sine');
+      scheduleTone(ctx, 783.99, 0.1, 0.15, 0.15, 'sine');
     } else if (kind === 'unlock') {
-      playTone(ctx, 783.99, 0, 0.09, 0.13, 'sine');
-      playTone(ctx, 523.25, 0.11, 0.16, 0.13, 'sine');
+      scheduleTone(ctx, 783.99, 0, 0.09, 0.13, 'sine');
+      scheduleTone(ctx, 523.25, 0.11, 0.16, 0.13, 'sine');
+    } else if (kind === 'step') {
+      scheduleTone(ctx, 440, 0, 0.04, 0.07, 'sine');
     } else {
-      playTone(ctx, 240, 0, 0.14, 0.18, 'triangle');
-      playTone(ctx, 180, 0.16, 0.2, 0.18, 'triangle');
+      scheduleTone(ctx, 230, 0, 0.14, 0.18, 'triangle');
+      scheduleTone(ctx, 180, 0.16, 0.2, 0.18, 'triangle');
     }
   } catch {
-    // Ignore autoplay restrictions
+    // Ignore
   }
 }
 
-function pulseEmergencySiren(severity: 'critical' | 'warning') {
-  const ctx = ensureAudioContext();
+async function pulseEmergencySiren(severity: 'critical' | 'warning') {
+  const ctx = await ensureResumedContext();
   if (!ctx) return;
   try {
     if (severity === 'critical') {
-      // High-urgency loud dual-tone emergency siren
-      playTone(ctx, 980, 0, 0.22, 0.28, 'sawtooth');
-      playTone(ctx, 1320, 0.24, 0.22, 0.28, 'sawtooth');
-      playTone(ctx, 980, 0.48, 0.22, 0.28, 'sawtooth');
-      playTone(ctx, 1320, 0.72, 0.26, 0.28, 'sawtooth');
+      scheduleTone(ctx, 980, 0, 0.22, 0.28, 'sawtooth');
+      scheduleTone(ctx, 1340, 0.24, 0.22, 0.28, 'sawtooth');
+      scheduleTone(ctx, 980, 0.48, 0.22, 0.28, 'sawtooth');
+      scheduleTone(ctx, 1340, 0.72, 0.26, 0.28, 'sawtooth');
     } else {
-      playTone(ctx, 780, 0, 0.2, 0.22, 'triangle');
-      playTone(ctx, 980, 0.25, 0.24, 0.22, 'triangle');
+      scheduleTone(ctx, 760, 0, 0.2, 0.24, 'triangle');
+      scheduleTone(ctx, 980, 0.24, 0.24, 0.24, 'triangle');
     }
   } catch {
-    // Ignore audio error
+    // Ignore
   }
 }
 
-export function startContinuousAlarm(
+export function startRepeatableAlarm(
   severity: 'critical' | 'warning',
   pushTitle?: string,
-  pushBody?: string
+  pushBody?: string,
+  alertTag?: string
 ): void {
-  stopContinuousAlarm();
+  stopRepeatableAlarm();
 
-  pulseEmergencySiren(severity);
-  alarmIntervalId = window.setInterval(() => {
-    pulseEmergencySiren(severity);
-  }, 1500);
+  void pulseEmergencySiren(severity);
+  sirenIntervalId = window.setInterval(() => {
+    void pulseEmergencySiren(severity);
+  }, 1450);
 
   if (typeof navigator !== 'undefined' && 'vibrate' in navigator) {
     const pattern = [500, 200, 500, 200, 800];
@@ -152,7 +164,7 @@ export function startContinuousAlarm(
       } catch {
         // Ignore
       }
-    }, 2500);
+    }, 2400);
   }
 
   if (
@@ -164,19 +176,19 @@ export function startContinuousAlarm(
     try {
       new Notification(pushTitle, {
         body: pushBody ?? '',
-        tag: 'safestep-live-alarm',
+        tag: alertTag ?? `safestep-alarm-${Date.now()}`,
         requireInteraction: true,
       });
     } catch {
-      // Some mobile browsers restrict direct Notification constructor
+      // Ignore mobile browser restriction
     }
   }
 }
 
-export function stopContinuousAlarm(): void {
-  if (alarmIntervalId !== null) {
-    window.clearInterval(alarmIntervalId);
-    alarmIntervalId = null;
+export function stopRepeatableAlarm(): void {
+  if (sirenIntervalId !== null) {
+    window.clearInterval(sirenIntervalId);
+    sirenIntervalId = null;
   }
   if (vibrateIntervalId !== null) {
     window.clearInterval(vibrateIntervalId);

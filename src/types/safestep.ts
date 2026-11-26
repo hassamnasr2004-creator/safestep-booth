@@ -1,34 +1,14 @@
 export type BandEditionId = 'batman' | 'spider' | 'astro' | 'frost';
 
-export type ZoneId =
-  | 'atrium'
-  | 'kids_arena'
-  | 'food_court'
-  | 'anchor_stores'
-  | 'exit_1'
-  | 'exit_2'
-  | 'exit_3'
-  | 'exit_4';
+export type LatLngTuple = [number, number];
 
-export type MainTab = 'booth' | 'parent' | 'print';
+export type BoothTabId = 'console' | 'print';
 
-export type DeviceRole = 'parent' | 'wristband' | 'booth';
+export type DeviceRole = 'parent' | 'band' | 'booth';
 
 export interface StoredDeviceRole {
   role: DeviceRole;
   activeBandId: string;
-}
-
-export interface Point2D {
-  x: number;
-  y: number;
-}
-
-export interface GpsPoint {
-  lat: number;
-  lng: number;
-  accuracy: number;
-  ts: number;
 }
 
 export interface BandEdition {
@@ -40,21 +20,13 @@ export interface BandEdition {
   prefix: string;
 }
 
-export interface MallZone {
-  id: ZoneId;
-  nameAr: string;
-  type: 'interior' | 'exit';
-  bounds: { x: number; y: number; width: number; height: number };
-  center: Point2D;
-}
-
-export type LiveAlertType = 'distance' | 'gate' | 'tamper';
+export type AlertKind = 'TAMPER_ATTEMPT' | 'GATE_PROXIMITY' | 'DISTANCE_BREACH';
 
 export interface LiveAlert {
-  id: string;
-  type: LiveAlertType;
+  alertId: number;
+  type: AlertKind;
   title: string;
-  zoneName: string;
+  locationLabel: string;
   distanceM: number;
   ts: number;
   acknowledged: boolean;
@@ -72,23 +44,24 @@ export interface LiveBandState {
   safeLimitM: number;
   createdAt: number;
   lastUpdated: number;
+  eventId: number;
   senderId: string;
-  currentZone: ZoneId;
-  mapPos: Point2D;
-  parentMapPos: Point2D;
-  pathHistory: Point2D[];
+  originCoords: LatLngTuple;
+  parentCoords: LatLngTuple;
+  childCoords: LatLngTuple;
+  gateCoords: LatLngTuple;
+  pathHistory: LatLngTuple[];
   steps: number;
+  headingDeg: number;
   distanceMeters: number;
-  coords: {
-    band: GpsPoint | null;
-    parent: GpsPoint | null;
-  };
+  gpsSource: 'gps' | 'fusion';
+  currentZoneLabel: string;
   activeAlert: LiveAlert | null;
 }
 
 export type SessionDictionary = Record<string, LiveBandState>;
 
-export type SyncStatus = 'connecting' | 'connected' | 'local';
+export type SyncStatus = 'connecting' | 'connected' | 'failover' | 'local';
 
 export interface ToastMessage {
   id: string;

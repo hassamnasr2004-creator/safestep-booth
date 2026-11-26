@@ -1,18 +1,6 @@
 @import "tailwindcss";
 
 @layer base {
-  :root {
-    --surface-canvas: #F8FAFC;
-    --surface-card: #FFFFFF;
-    --border-hairline: #E2E8F0;
-    --ink-primary: #0F172A;
-    --ink-muted: #475569;
-    --accent-navy: #1E3A8A;
-    --semantic-safe: #0D9488;
-    --semantic-warn: #D97706;
-    --semantic-alert: #DC2626;
-  }
-
   html {
     font-family: 'Alexandria', system-ui, -apple-system, sans-serif;
     direction: rtl;
@@ -20,8 +8,13 @@
   }
 
   body {
-    background-color: var(--surface-canvas);
-    color: var(--ink-primary);
+    min-height: 100vh;
+    background:
+      radial-gradient(900px 600px at 88% 8%, rgba(14, 165, 233, 0.08), transparent 65%),
+      radial-gradient(800px 540px at 10% 88%, rgba(16, 185, 129, 0.07), transparent 65%),
+      linear-gradient(145deg, #EDF2F7 0%, #F4F7FB 50%, #F8FAFC 100%);
+    background-attachment: fixed;
+    color: #0F172A;
     font-feature-settings: "kern" 1;
   }
 }
@@ -30,14 +23,83 @@
   font-variant-numeric: tabular-nums;
 }
 
-/* Precision crop mark styling for QR Print Studio */
+/* Soft Frosted Glass Surfaces (Apple visionOS / iOS 18 Daylight) */
+.glass-card {
+  background: rgba(255, 255, 255, 0.65);
+  backdrop-filter: blur(24px);
+  -webkit-backdrop-filter: blur(24px);
+  border: 1px solid rgba(255, 255, 255, 0.85);
+  box-shadow: 0 8px 32px rgba(15, 23, 42, 0.06);
+}
+
+.glass-panel {
+  background: rgba(255, 255, 255, 0.78);
+  backdrop-filter: blur(28px);
+  -webkit-backdrop-filter: blur(28px);
+  border: 1px solid rgba(255, 255, 255, 0.9);
+  box-shadow: 0 12px 38px rgba(15, 23, 42, 0.07);
+}
+
+/* Smooth Leaflet Map Enhancements */
+.leaflet-container {
+  font-family: 'Alexandria', system-ui, sans-serif !important;
+  background: #EDF2F7 !important;
+  z-index: 1;
+}
+
+.leaflet-marker-icon.smooth-glide-marker {
+  transition: transform 0.38s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes tetherFlow {
+  to {
+    stroke-dashoffset: -28;
+  }
+}
+
+.tether-animated-line {
+  animation: tetherFlow 1.1s linear infinite;
+}
+
+@keyframes beaconPulse {
+  0% {
+    transform: scale(0.85);
+    opacity: 0.7;
+  }
+  70% {
+    transform: scale(1.9);
+    opacity: 0;
+  }
+  100% {
+    transform: scale(1.9);
+    opacity: 0;
+  }
+}
+
+.beacon-ring {
+  animation: beaconPulse 2s cubic-bezier(0.16, 1, 0.3, 1) infinite;
+}
+
+@keyframes redAlertPulse {
+  0%, 100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.88;
+  }
+}
+
+.alert-flash-bg {
+  animation: redAlertPulse 1.2s ease-in-out infinite;
+}
+
+/* Print Sticker Isolation */
 .crop-mark-card {
   position: relative;
   break-inside: avoid;
   page-break-inside: avoid;
 }
 
-/* Strict Print Media Isolation for A4 QR Label Studio */
 @media print {
   @page {
     size: A4 portrait;
@@ -67,6 +129,7 @@
     border: none !important;
     box-shadow: none !important;
     background: #FFFFFF !important;
+    backdrop-filter: none !important;
   }
 
   .print-sheet-grid {

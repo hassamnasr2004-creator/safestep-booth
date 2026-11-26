@@ -5,11 +5,16 @@ import {
   StoredDeviceRole,
   SyncStatus,
 } from '../types/safestep';
+import { sanitizeBandState } from '../data/safestepData';
 
-const BROKER_URL = 'wss://broker.emqx.io:8084/mqtt';
-const BC_NAME = 'safestep_live_sync_v3';
+// Dual-broker auto-healing failover list
+const BROKERS = [
+  'wss://broker.emqx.io:8084/mqtt',
+  'wss://broker.hivemq.com:8884/mqtt',
+] as const;
 
-// Versioned persistent storage keys
+const BC_NAME = 'safestep_live_sync_v4';
+
 export const ACTIVE_SESSIONS_KEY = 'safestep_active_sessions_v1';
 export const MY_ROLE_KEY = 'safestep_my_role_v1';
 export const RETURNED_COUNT_KEY = 'safestep_returned_count_v1';
@@ -23,14 +28,18 @@ export function getBandStateTopic(bandId: string): string {
 export type BandUpdateHandler = (state: LiveBandState) => void;
 export type StatusChangeHandler = (status: SyncStatus) => void;
 
-class SafeStepLiveSync {
+class SafeStepDualBrokerSync {
   private client: MqttClient | null = null;
   private bc: BroadcastChannel | null = null;
+  private brokerIndex = 0;
+  private failCount = 0;
+  private connectTimeoutWatch: number | null = null;
   private subscribedBands = new Set<string>();
   private listeners = new Set<BandUpdateHandler>();
   private statusListeners = new Set<StatusChangeHandler>();
   private status: SyncStatus = 'connecting';
   private started = false;
+  private lastPublishedState = new Map<string, LiveBandState>();
 
   public start(): void {
     if (this.started || typeof window === 'undefined') return;
@@ -41,8 +50,8 @@ class SafeStepLiveSync {
       try {
         this.bc = new BroadcastChannel(BC_NAME);
         this.bc.onmessage = (ev) => {
-          const msg = ev.data as LiveBandState | undefined;
-          if (msg && msg.bandId && msg.senderId !== CLIENT_ID) {
+          const msg = sanitizeBandState(ev.data);
+          if (msg && msg.senderId !== CLIENT_ID) {
             this.emitUpdate(msg);
           }
         };
@@ -55,11 +64,12 @@ class SafeStepLiveSync {
     window.addEventListener('storage', (ev) => {
       if (ev.key !== ACTIVE_SESSIONS_KEY || !ev.newValue) return;
       try {
-        const dict = JSON.parse(ev.newValue) as SessionDictionary;
-        if (dict && typeof dict === 'object') {
-          Object.values(dict).forEach((b) => {
-            if (b && b.bandId && b.senderId !== CLIENT_ID) {
-              this.emitUpdate(b);
+        const dict = JSON.parse(ev.newValue) as Record<string, unknown>;
+        if (dict && typeof dict === 'object' && !Array.isArray(dict)) {
+          Object.values(dict).forEach((rawBand) => {
+            const clean = sanitizeBandState(rawBand);
+            if (clean && clean.senderId !== CLIENT_ID) {
+              this.emitUpdate(clean);
             }
           });
         }
@@ -68,27 +78,70 @@ class SafeStepLiveSync {
       }
     });
 
-    // 3. Cloud-Retained Cross-Device MQTT over WebSockets (QoS 1 + retain: true)
+    // 3. Auto-heal on phone screen wake or network restore (<300ms retained pull)
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') {
+        this.healAndResubscribe();
+      }
+    });
+
+    window.addEventListener('online', () => {
+      this.healAndResubscribe();
+    });
+
+    // 4. Connect to primary broker (EMQX -> automatic failover to HiveMQ)
+    this.connectBroker(0);
+  }
+
+  private clearWatchTimer() {
+    if (this.connectTimeoutWatch !== null) {
+      window.clearTimeout(this.connectTimeoutWatch);
+      this.connectTimeoutWatch = null;
+    }
+  }
+
+  private connectBroker(index: number): void {
+    this.clearWatchTimer();
+    if (this.client) {
+      try {
+        this.client.removeAllListeners();
+        this.client.end(true);
+      } catch {
+        // Ignore
+      }
+      this.client = null;
+    }
+
+    this.brokerIndex = index % BROKERS.length;
+    const url = BROKERS[this.brokerIndex];
+    this.setStatus(this.brokerIndex === 0 ? 'connecting' : 'failover');
+
     try {
-      this.setStatus('connecting');
-      const client = mqtt.connect(BROKER_URL, {
-        clientId: CLIENT_ID,
+      const client = mqtt.connect(url, {
+        clientId: `${CLIENT_ID}_${this.brokerIndex}`,
         clean: true,
-        reconnectPeriod: 3000,
-        connectTimeout: 8000,
-        keepalive: 30,
+        keepalive: 15,
+        reconnectPeriod: 1500,
+        connectTimeout: 5500,
       });
       this.client = client;
 
+      // Failover watchdog if primary broker fails to connect within 6s
+      this.connectTimeoutWatch = window.setTimeout(() => {
+        if (this.client && !this.client.connected) {
+          this.failoverNext();
+        }
+      }, 6000);
+
       client.on('connect', () => {
+        this.clearWatchTimer();
+        this.failCount = 0;
         this.setStatus('connected');
-        this.subscribedBands.forEach((bandId) => {
-          client.subscribe(getBandStateTopic(bandId), { qos: 1 });
-        });
+        this.resubscribeAll();
       });
 
       client.on('reconnect', () => {
-        this.setStatus('connecting');
+        this.setStatus(this.brokerIndex === 0 ? 'connecting' : 'failover');
       });
 
       client.on('offline', () => {
@@ -96,16 +149,19 @@ class SafeStepLiveSync {
       });
 
       client.on('error', () => {
-        this.setStatus('local');
+        this.failCount += 1;
+        if (this.failCount >= 2) {
+          this.failCount = 0;
+          this.failoverNext();
+        }
       });
 
       client.on('message', (_topic, payload) => {
         const raw = payload.toString('utf-8').trim();
-        // Empty payload means retained state was officially cleared upon wristband return
         if (!raw) return;
         try {
-          const parsed = JSON.parse(raw) as LiveBandState;
-          if (!parsed || !parsed.bandId) return;
+          const parsed = sanitizeBandState(JSON.parse(raw));
+          if (!parsed) return;
           if (parsed.senderId === CLIENT_ID) return;
           this.emitUpdate(parsed);
         } catch {
@@ -117,8 +173,45 @@ class SafeStepLiveSync {
     }
   }
 
-  public getStatus(): SyncStatus {
-    return this.status;
+  private failoverNext(): void {
+    const nextIdx = (this.brokerIndex + 1) % BROKERS.length;
+    this.connectBroker(nextIdx);
+  }
+
+  private resubscribeAll(): void {
+    if (!this.client || !this.client.connected) return;
+    this.subscribedBands.forEach((bandId) => {
+      const topic = getBandStateTopic(bandId);
+      // Unsubscribe + re-subscribe forces immediate delivery of latest retained snapshot on wake
+      this.client?.unsubscribe(topic, () => {
+        this.client?.subscribe(topic, { qos: 1 });
+      });
+    });
+  }
+
+  public healAndResubscribe(): void {
+    if (!this.client) {
+      this.connectBroker(this.brokerIndex);
+      return;
+    }
+    if (this.client.connected) {
+      this.resubscribeAll();
+      // Also flush any locally buffered band states
+      this.lastPublishedState.forEach((state, bandId) => {
+        if (!state.isReturned) {
+          this.client?.publish(getBandStateTopic(bandId), JSON.stringify(state), {
+            qos: 1,
+            retain: true,
+          });
+        }
+      });
+    } else {
+      try {
+        this.client.reconnect();
+      } catch {
+        this.connectBroker(this.brokerIndex);
+      }
+    }
   }
 
   private setStatus(next: SyncStatus): void {
@@ -149,22 +242,25 @@ class SafeStepLiveSync {
   public subscribeBand(bandId: string): void {
     const clean = bandId.trim().toUpperCase();
     if (!clean) return;
-    if (this.subscribedBands.has(clean)) return;
+    const isNew = !this.subscribedBands.has(clean);
     this.subscribedBands.add(clean);
-    if (this.client && this.client.connected) {
+    if (isNew && this.client && this.client.connected) {
       this.client.subscribe(getBandStateTopic(clean), { qos: 1 });
     }
   }
 
   public publishState(state: LiveBandState): void {
     const clean = state.bandId.trim().toUpperCase();
+    const now = Date.now();
     const stamped: LiveBandState = {
       ...state,
       bandId: clean,
-      lastUpdated: Date.now(),
+      lastUpdated: now,
+      eventId: Math.max(now, (state.eventId ?? 0) + 1),
       senderId: CLIENT_ID,
     };
 
+    this.lastPublishedState.set(clean, stamped);
     this.subscribeBand(clean);
     const topic = getBandStateTopic(clean);
 
@@ -183,38 +279,39 @@ class SafeStepLiveSync {
       try {
         this.bc.postMessage(stamped);
       } catch {
-        // Ignore closed channel
+        // Ignore
       }
     }
   }
 
-  // Official Return & Unlock: broadcast returned state immediately, then wipe retained MQTT topic
   public publishReturnAndClearRetained(state: LiveBandState): void {
     const clean = state.bandId.trim().toUpperCase();
     const topic = getBandStateTopic(clean);
+    const now = Date.now();
     const returnedPayload: LiveBandState = {
       ...state,
       bandId: clean,
       isReturned: true,
       lockStatus: 'unlocked',
       activeAlert: null,
-      lastUpdated: Date.now(),
+      lastUpdated: now,
+      eventId: Math.max(now, (state.eventId ?? 0) + 1),
       senderId: CLIENT_ID,
     };
 
+    this.lastPublishedState.delete(clean);
+
     if (this.client && this.client.connected) {
       try {
-        // 1. Notify live connected devices immediately
         this.client.publish(topic, JSON.stringify(returnedPayload), {
           qos: 1,
           retain: false,
         });
-        // 2. Clear retained broker message so returned band never reappears on future scans
         window.setTimeout(() => {
           if (this.client && this.client.connected) {
             this.client.publish(topic, '', { qos: 1, retain: true });
           }
-        }, 250);
+        }, 280);
       } catch {
         // Ignore
       }
@@ -230,9 +327,9 @@ class SafeStepLiveSync {
   }
 }
 
-export const liveSync = new SafeStepLiveSync();
+export const liveSync = new SafeStepDualBrokerSync();
 
-// Bulletproof localStorage dictionary persistence
+// Bulletproof localStorage helpers
 export function hasStoredSessionsKey(): boolean {
   try {
     return window.localStorage.getItem(ACTIVE_SESSIONS_KEY) !== null;
@@ -245,12 +342,13 @@ export function loadActiveSessions(): SessionDictionary {
   try {
     const raw = window.localStorage.getItem(ACTIVE_SESSIONS_KEY);
     if (!raw) return {};
-    const parsed = JSON.parse(raw) as SessionDictionary;
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
     const clean: SessionDictionary = {};
-    for (const [id, session] of Object.entries(parsed)) {
-      if (session && session.bandId && !session.isReturned) {
-        clean[id] = session;
+    for (const session of Object.values(parsed)) {
+      const sanitized = sanitizeBandState(session);
+      if (sanitized && !sanitized.isReturned) {
+        clean[sanitized.bandId] = sanitized;
       }
     }
     return clean;
@@ -263,7 +361,7 @@ export function saveActiveSessions(dict: SessionDictionary): void {
   try {
     window.localStorage.setItem(ACTIVE_SESSIONS_KEY, JSON.stringify(dict));
   } catch {
-    // Ignore storage quota error
+    // Ignore
   }
 }
 
@@ -275,7 +373,7 @@ export function loadMyRole(): StoredDeviceRole | null {
     if (
       parsed &&
       (parsed.role === 'parent' ||
-        parsed.role === 'wristband' ||
+        parsed.role === 'band' ||
         parsed.role === 'booth')
     ) {
       return {
