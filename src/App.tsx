@@ -1,35 +1,33 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   BandEditionId,
-  BoothTabId,
-  LatLngTuple,
   LiveBandState,
+  MainTabId,
+  MallPoint,
+  ReturnedBandRecord,
+  ScenarioId,
   SessionDictionary,
-  StoredDeviceRole,
   SyncStatus,
   ToastMessage,
 } from './types/safestep';
 import {
-  DEFAULT_ORIGIN,
-  computeGateCoords,
+  DEFAULT_CHILD_POS,
+  DEFAULT_PARENT_POS,
+  MALL_GATES,
+  clampMallPoint,
   createDemoBand,
   createInitialBandState,
   createNewAlertId,
-  deriveZoneLabel,
+  evaluateMallPosition,
   generateBandId,
   generatePin,
-  offsetLatLng,
 } from './data/safestepData';
 import {
   CLIENT_ID,
-  hasStoredSessionsKey,
+  clearLegacyStuckStorage,
   liveSync,
-  loadActiveSessions,
-  loadMyRole,
-  loadReturnedCount,
-  saveActiveSessions,
-  saveMyRole,
-  saveReturnedCount,
+  loadJuryStorage,
+  saveJuryStorage,
 } from './utils/liveSync';
 import { playShortChime } from './utils/audioAlerts';
 import { TopNav } from './components/TopNav';
@@ -39,7 +37,7 @@ import { BandWearableView } from './components/BandWearableView';
 import { PrintQrTab } from './components/PrintQrTab';
 import { ToastStack } from './components/ToastStack';
 
-const BASE_URL_KEY = 'safestep_public_base_url_v2';
+const BASE_URL_KEY = 'safestep_public_base_url_v4';
 
 function getInitialBaseUrl(): string {
   if (typeof window === 'undefined') return '';
@@ -52,91 +50,263 @@ function getInitialBaseUrl(): string {
   return `${window.location.origin}${window.location.pathname}`;
 }
 
-function bootstrapRoleAndSessions(): {
-  initialSessions: SessionDictionary;
-  initialRole: StoredDeviceRole;
-} {
+interface BootState {
+  sessions: SessionDictionary;
+  returnedHistory: Record<string, ReturnedBandRecord>;
+  returnedCount: number;
+  selectedBandId: string;
+  scanMode: 'none' | 'parent' | 'band';
+  scanBandId: string;
+}
+
+function bootstrapJuryApp(): BootState {
+  // Explicitly delete any legacy stuck role keys so the presenter is NEVER trapped
+  clearLegacyStuckStorage();
+
   const params =
     typeof window !== 'undefined'
       ? new URLSearchParams(window.location.search)
       : new URLSearchParams();
 
-  const rawRole = params.get('role')?.trim().toLowerCase();
-  const bParam = params.get('b')?.trim().toUpperCase() || '';
+  const pParam = params.get('p')?.trim().toUpperCase() || '';
   const wParam = params.get('w')?.trim().toUpperCase() || '';
+  const legacyRole = params.get('role')?.trim().toLowerCase() || '';
+  const legacyB = params.get('b')?.trim().toUpperCase() || '';
 
-  const isUrlBand = (rawRole === 'band' && Boolean(bParam)) || Boolean(wParam);
-  const isUrlParent =
-    (rawRole === 'parent' && Boolean(bParam)) || (!rawRole && Boolean(bParam));
-  const urlBandId = bParam || wParam;
+  let scanMode: BootState['scanMode'] = 'none';
+  let scanBandId = '';
 
-  // 1. Strictly load persisted sessions (never overwrite active stored data)
-  let sessions: SessionDictionary;
-  if (hasStoredSessionsKey()) {
-    sessions = loadActiveSessions();
-    // If legacy pre-Leaflet entries were filtered out and no bands were returned yet, seed fresh demo band for Booth
-    if (
-      Object.keys(sessions).length === 0 &&
-      !isUrlParent &&
-      !isUrlBand &&
-      loadReturnedCount() === 0
-    ) {
-      const demo = createDemoBand(CLIENT_ID);
-      sessions = { [demo.bandId]: demo };
-      saveActiveSessions(sessions);
-    }
-  } else if (isUrlParent || isUrlBand) {
-    sessions = {};
-  } else {
+  if (pParam) {
+    scanMode = 'parent';
+    scanBandId = pParam;
+  } else if (wParam) {
+    scanMode = 'band';
+    scanBandId = wParam;
+  } else if (legacyRole === 'band' && legacyB) {
+    scanMode = 'band';
+    scanBandId = legacyB;
+  } else if (legacyB) {
+    scanMode = 'parent';
+    scanBandId = legacyB;
+  }
+
+  const stored = loadJuryStorage();
+  let sessions: SessionDictionary = stored?.sessions ?? {};
+  const returnedHistory = stored?.returnedHistory ?? {};
+  const returnedCount = stored?.returnedCount ?? 0;
+
+  // On main app (/), always guarantee an active ready-to-demo wristband if none exist and none returned yet
+  if (
+    scanMode === 'none' &&
+    Object.keys(sessions).length === 0 &&
+    returnedCount === 0
+  ) {
     const demo = createDemoBand(CLIENT_ID);
     sessions = { [demo.bandId]: demo };
-    saveActiveSessions(sessions);
+    saveJuryStorage({ sessions, returnedHistory, returnedCount });
   }
 
-  // 2. Strict Role Resolution + Auto-Resume on Reopen
-  let role: StoredDeviceRole;
-  if (isUrlBand && urlBandId) {
-    role = { role: 'band', activeBandId: urlBandId };
-    saveMyRole(role);
-  } else if (isUrlParent && urlBandId) {
-    role = { role: 'parent', activeBandId: urlBandId };
-    saveMyRole(role);
-  } else {
-    const saved = loadMyRole();
-    if (saved && (saved.role === 'parent' || saved.role === 'band') && saved.activeBandId) {
-      role = saved;
-    } else if (saved && saved.role === 'booth') {
-      role = saved;
+  const firstId = Object.keys(sessions)[0] ?? '';
+  return {
+    sessions,
+    returnedHistory,
+    returnedCount,
+    selectedBandId: scanBandId || firstId,
+    scanMode,
+    scanBandId,
+  };
+}
+
+// Evaluate next band state after child or parent moves on the Smart Mall Map
+function applyPositionEvaluation(
+  prev: LiveBandState,
+  nextChild: MallPoint,
+  nextParent: MallPoint,
+  opts: {
+    addSteps: number;
+    headingDeg?: number;
+    appendTrail: boolean;
+  }
+): LiveBandState {
+  const evalInfo = evaluateMallPosition(nextChild, nextParent, prev.safeLimitM);
+  const dist = evalInfo.distParent;
+
+  let activeAlert = prev.activeAlert;
+  let recoveryNotice = prev.recoveryNotice;
+
+  // Keep TAMPER_ATTEMPT until Parent/Security confirms clasp lock
+  if (
+    (prev.lockStatus === 'tampered' ||
+      prev.activeAlert?.type === 'TAMPER_ATTEMPT') &&
+    prev.activeAlert &&
+    !prev.activeAlert.acknowledged
+  ) {
+    activeAlert = { ...prev.activeAlert, distanceM: dist };
+  } else if (evalInfo.nearGate && evalInfo.nearestGate) {
+    const gateNum = evalInfo.nearestGate.id;
+    if (
+      !activeAlert ||
+      activeAlert.acknowledged ||
+      activeAlert.type !== 'GATE_PROXIMITY' ||
+      activeAlert.gateNumber !== gateNum
+    ) {
+      activeAlert = {
+        alertId: createNewAlertId(),
+        type: 'GATE_PROXIMITY',
+        title: `تحذير: الطفل يقترب من بوابة الخروج ${gateNum}`,
+        locationLabel: `بوابة الخروج ${gateNum}`,
+        gateNumber: gateNum,
+        distanceM: dist,
+        ts: Date.now(),
+        acknowledged: false,
+        securityNotified: false,
+      };
     } else {
-      const firstId = Object.keys(sessions)[0] ?? '';
-      role = { role: 'booth', activeBandId: firstId };
-      saveMyRole(role);
+      activeAlert = { ...activeAlert, distanceM: dist };
+    }
+  } else if (
+    prev.activeAlert?.type === 'GATE_PROXIMITY' &&
+    evalInfo.nearestGateDist > 6.2
+  ) {
+    // Auto-clear GATE_PROXIMITY once child moves back away from exit gate
+    if (!evalInfo.outsideSafe) {
+      activeAlert = null;
+      recoveryNotice = {
+        id: createNewAlertId(),
+        kind: 'gate',
+        text: 'ابتعد الطفل عن البوابة وعاد لمنطقة آمنة — توقف الإنذار تلقائياً',
+        ts: Date.now(),
+      };
+    } else {
+      activeAlert = {
+        alertId: createNewAlertId(),
+        type: 'DISTANCE_BREACH',
+        title: `تنبيه: ابتعد الطفل وتجاوز نطاق الأمان (${dist.toFixed(1)} متر)`,
+        locationLabel: evalInfo.zoneName,
+        distanceM: dist,
+        ts: Date.now(),
+        acknowledged: false,
+        securityNotified: false,
+      };
+    }
+  } else if (evalInfo.outsideSafe) {
+    // Distance Breach Alert
+    if (
+      !activeAlert ||
+      activeAlert.acknowledged ||
+      activeAlert.type !== 'DISTANCE_BREACH'
+    ) {
+      activeAlert = {
+        alertId: createNewAlertId(),
+        type: 'DISTANCE_BREACH',
+        title: `تنبيه: ابتعد الطفل وتجاوز نطاق الأمان (${dist.toFixed(1)} متر)`,
+        locationLabel: evalInfo.zoneName,
+        distanceM: dist,
+        ts: Date.now(),
+        acknowledged: false,
+        securityNotified: false,
+      };
+    } else {
+      activeAlert = {
+        ...activeAlert,
+        title: `تنبيه: ابتعد الطفل وتجاوز نطاق الأمان (${dist.toFixed(1)} متر)`,
+        locationLabel: evalInfo.zoneName,
+        distanceM: dist,
+      };
+    }
+  } else {
+    // Child is inside Safe Radius & away from gates -> AUTOMATIC ALARM SHUTOFF!
+    if (prev.activeAlert?.type === 'DISTANCE_BREACH') {
+      activeAlert = null;
+      recoveryNotice = {
+        id: createNewAlertId(),
+        kind: 'distance',
+        text: 'عاد الطفل إلى النطاق الآمن — توقف الإنذار تلقائياً',
+        ts: Date.now(),
+      };
+    } else if (
+      prev.activeAlert?.type === 'GATE_PROXIMITY' &&
+      evalInfo.nearestGateDist > 6.2
+    ) {
+      activeAlert = null;
+      recoveryNotice = {
+        id: createNewAlertId(),
+        kind: 'gate',
+        text: 'ابتعد الطفل عن البوابة وعاد لمنطقة آمنة — توقف الإنذار تلقائياً',
+        ts: Date.now(),
+      };
     }
   }
 
-  return { initialSessions: sessions, initialRole: role };
+  let nextHistory = prev.pathHistory;
+  if (opts.appendTrail) {
+    const lastPt = prev.pathHistory[prev.pathHistory.length - 1];
+    const moved = lastPt
+      ? Math.hypot(nextChild.x - lastPt.x, nextChild.y - lastPt.y)
+      : 99;
+    if (moved >= 0.7) {
+      nextHistory = [...prev.pathHistory.slice(-55), nextChild];
+    }
+  }
+
+  return {
+    ...prev,
+    parentPos: nextParent,
+    childPos: nextChild,
+    pathHistory: nextHistory,
+    steps: prev.steps + opts.addSteps,
+    headingDeg: opts.headingDeg ?? prev.headingDeg,
+    distanceMeters: dist,
+    currentZoneLabel: evalInfo.zoneName,
+    nearGateNumber:
+      evalInfo.nearGate && evalInfo.nearestGate ? evalInfo.nearestGate.id : null,
+    activeAlert,
+    recoveryNotice,
+  };
 }
 
 export default function App() {
-  const [boot] = useState(() => bootstrapRoleAndSessions());
-  const [sessions, setSessions] = useState<SessionDictionary>(
-    boot.initialSessions
+  const [boot] = useState(() => bootstrapJuryApp());
+  const [sessions, setSessions] = useState<SessionDictionary>(boot.sessions);
+  const [returnedHistory, setReturnedHistory] = useState<
+    Record<string, ReturnedBandRecord>
+  >(boot.returnedHistory);
+  const [returnedCount, setReturnedCount] = useState<number>(boot.returnedCount);
+  const [selectedBandId, setSelectedBandId] = useState<string>(
+    boot.selectedBandId
   );
-  const [deviceRole, setDeviceRole] = useState<StoredDeviceRole>(
-    boot.initialRole
-  );
-  const [boothTab, setBoothTab] = useState<BoothTabId>('console');
-  const [returnedCount, setReturnedCount] = useState<number>(() =>
-    loadReturnedCount()
-  );
-  const [lastReturnedInfo, setLastReturnedInfo] = useState<{
-    bandId: string;
-    childName: string;
-  } | null>(null);
-  const [boothOrigin, setBoothOrigin] = useState<LatLngTuple>(DEFAULT_ORIGIN);
+  const [scanMode, setScanMode] = useState<BootState['scanMode']>(boot.scanMode);
+  const [scanBandId, setScanBandId] = useState<string>(boot.scanBandId);
+  const [activeTab, setActiveTab] = useState<MainTabId>('booth');
+  const [lastReturnedInfo, setLastReturnedInfo] =
+    useState<ReturnedBandRecord | null>(null);
   const [baseUrl, setBaseUrl] = useState<string>(getInitialBaseUrl);
   const [syncStatus, setSyncStatus] = useState<SyncStatus>('connecting');
+  const [activeScenario, setActiveScenario] = useState<ScenarioId | null>(null);
   const [toasts, setToasts] = useState<ToastMessage[]>([]);
+
+  const scenarioTimerRef = useRef<number | null>(null);
+  const sessionsRef = useRef(sessions);
+
+  useEffect(() => {
+    sessionsRef.current = sessions;
+  }, [sessions]);
+
+  const stopScenarioAnimation = useCallback(() => {
+    if (scenarioTimerRef.current !== null) {
+      window.clearInterval(scenarioTimerRef.current);
+      scenarioTimerRef.current = null;
+    }
+    setActiveScenario(null);
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      if (scenarioTimerRef.current !== null) {
+        window.clearInterval(scenarioTimerRef.current);
+      }
+    };
+  }, []);
 
   const activeBands = useMemo(
     () =>
@@ -146,32 +316,17 @@ export default function App() {
     [sessions]
   );
 
-  // Acquire real GPS origin once on Booth console for accurate room-scale mapping
+  // Persist to fresh safestep_jury_v4 storage key continuously
   useEffect(() => {
-    if (deviceRole.role !== 'booth' || !('geolocation' in navigator)) return;
-    navigator.geolocation.getCurrentPosition(
-      (pos) => {
-        setBoothOrigin([
-          Number(pos.coords.latitude.toFixed(7)),
-          Number(pos.coords.longitude.toFixed(7)),
-        ]);
-      },
-      () => {},
-      { enableHighAccuracy: true, timeout: 6000, maximumAge: 60000 }
-    );
-  }, [deviceRole.role]);
+    saveJuryStorage({ sessions, returnedHistory, returnedCount });
+  }, [sessions, returnedHistory, returnedCount]);
 
   const addToast = useCallback((type: ToastMessage['type'], title: string) => {
     const id = `t-${Date.now()}-${Math.random().toString(36).slice(2, 5)}`;
     setToasts((prev) => [{ id, type, title }, ...prev].slice(0, 3));
     window.setTimeout(() => {
       setToasts((prev) => prev.filter((t) => t.id !== id));
-    }, 3400);
-  }, []);
-
-  const updateDeviceRole = useCallback((next: StoredDeviceRole) => {
-    setDeviceRole(next);
-    saveMyRole(next);
+    }, 3600);
   }, []);
 
   const handleChangeBaseUrl = useCallback((next: string) => {
@@ -183,45 +338,25 @@ export default function App() {
     }
   }, []);
 
-  useEffect(() => {
-    saveActiveSessions(sessions);
-  }, [sessions]);
-
-  useEffect(() => {
-    saveMyRole(deviceRole);
-  }, [deviceRole]);
-
-  useEffect(() => {
-    saveReturnedCount(returnedCount);
-  }, [returnedCount]);
-
   // Dual-Broker Auto-Healing MQTT + BroadcastChannel live sync
   useEffect(() => {
     liveSync.start();
     const unsubStatus = liveSync.onStatus(setSyncStatus);
     const unsubUpdate = liveSync.onUpdate((incoming) => {
       if (incoming.isReturned) {
+        const record: ReturnedBandRecord = {
+          bandId: incoming.bandId,
+          childName: incoming.childName,
+          returnedAt: incoming.returnedAt ?? incoming.lastUpdated ?? Date.now(),
+        };
+        setReturnedHistory((prev) => ({ ...prev, [record.bandId]: record }));
         setSessions((prev) => {
           const next = { ...prev };
           delete next[incoming.bandId];
-          saveActiveSessions(next);
           return next;
         });
-        setLastReturnedInfo({
-          bandId: incoming.bandId,
-          childName: incoming.childName,
-        });
+        setLastReturnedInfo(record);
         setReturnedCount((c) => c + 1);
-        setDeviceRole((prevRole) => {
-          if (
-            prevRole.activeBandId === incoming.bandId &&
-            (prevRole.role === 'parent' || prevRole.role === 'band')
-          ) {
-            saveMyRole({ role: 'booth', activeBandId: '' });
-            return prevRole;
-          }
-          return prevRole;
-        });
         void playShortChime('unlock');
         return;
       }
@@ -235,12 +370,10 @@ export default function App() {
         ) {
           return prev;
         }
-        const next: SessionDictionary = {
+        return {
           ...prev,
           [incoming.bandId]: incoming,
         };
-        saveActiveSessions(next);
-        return next;
       });
     });
 
@@ -250,17 +383,20 @@ export default function App() {
     };
   }, []);
 
-  // Subscribe to all active bands + bound role band
+  // Subscribe to all active bands + scanned QR band
   useEffect(() => {
-    if (deviceRole.activeBandId) {
-      liveSync.subscribeBand(deviceRole.activeBandId);
+    if (scanBandId) {
+      liveSync.subscribeBand(scanBandId);
+    }
+    if (selectedBandId) {
+      liveSync.subscribeBand(selectedBandId);
     }
     activeBands.forEach((b) => liveSync.subscribeBand(b.bandId));
-  }, [activeBands, deviceRole.activeBandId]);
+  }, [activeBands, scanBandId, selectedBandId]);
 
-  // Flush Booth active bands on initial connect so scanning phones immediately receive retained state
+  // Republish Booth active bands upon connect so freshly scanned phones immediately receive retained state
   useEffect(() => {
-    if (syncStatus === 'connected' && deviceRole.role === 'booth') {
+    if (syncStatus === 'connected' && scanMode === 'none') {
       activeBands.forEach((b) => liveSync.publishState(b));
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -278,16 +414,14 @@ export default function App() {
           eventId: Math.max(now, (existing.eventId ?? 0) + 1),
           senderId: CLIENT_ID,
         };
-        const next: SessionDictionary = { ...prev, [bandId]: updated };
-        saveActiveSessions(next);
         liveSync.publishState(updated);
-        return next;
+        return { ...prev, [bandId]: updated };
       });
     },
     []
   );
 
-  // Issue New Wristband from Booth
+  // Issue New Wristband
   const handleCreateBand = useCallback(
     (params: {
       editionId: BandEditionId;
@@ -295,6 +429,7 @@ export default function App() {
       guardianPhone: string;
       safeLimitM: number;
     }) => {
+      stopScenarioAnimation();
       const bandId = generateBandId(params.editionId);
       const newBand = createInitialBandState({
         bandId,
@@ -303,234 +438,311 @@ export default function App() {
         guardianPhone: params.guardianPhone,
         pinCode: generatePin(),
         safeLimitM: params.safeLimitM,
-        origin: boothOrigin,
         senderId: CLIENT_ID,
       });
 
-      setSessions((prev) => {
-        const next: SessionDictionary = { ...prev, [bandId]: newBand };
-        saveActiveSessions(next);
-        return next;
-      });
+      setSessions((prev) => ({ ...prev, [bandId]: newBand }));
+      setSelectedBandId(bandId);
       setLastReturnedInfo(null);
-      updateDeviceRole({ role: 'booth', activeBandId: bandId });
       liveSync.publishState(newBand);
       void playShortChime('lock');
       addToast('success', `تم تفعيل السوار ${bandId}`);
     },
-    [boothOrigin, updateDeviceRole, addToast]
+    [stopScenarioAnimation, addToast]
   );
 
-  // Sensor-Fusion Child Movement + Repeatable Breach/Gate Alert Evaluation
-  const handleMoveChild = useCallback(
-    (
-      bandId: string,
-      nextCoords: LatLngTuple,
-      opts: { addSteps: number; headingDeg?: number; source: 'gps' | 'fusion' }
-    ) => {
+  // Direct Drag Child Pin on Smart Mall Map
+  const handleDragChild = useCallback(
+    (bandId: string, rawPos: MallPoint) => {
+      stopScenarioAnimation();
+      const pos = clampMallPoint(rawPos);
       updateAndPublishBand(bandId, (prev) => {
-        const zoneInfo = deriveZoneLabel(
-          nextCoords,
-          prev.parentCoords,
-          prev.gateCoords,
-          prev.safeLimitM
+        const moved = Math.hypot(
+          pos.x - prev.childPos.x,
+          pos.y - prev.childPos.y
         );
-        const dist = zoneInfo.distParent;
+        const addSteps = moved >= 0.8 ? Math.max(1, Math.round(moved)) : 0;
+        const headingDeg =
+          moved > 0.2
+            ? Math.round(
+                ((Math.atan2(pos.x - prev.childPos.x, -(pos.y - prev.childPos.y)) *
+                  180) /
+                  Math.PI +
+                  360) %
+                  360
+              )
+            : prev.headingDeg;
+        return applyPositionEvaluation(prev, pos, prev.parentPos, {
+          addSteps,
+          headingDeg,
+          appendTrail: true,
+        });
+      });
+    },
+    [stopScenarioAnimation, updateAndPublishBand]
+  );
 
-        let activeAlert = prev.activeAlert;
+  // Direct Drag Parent Beacon Pin on Smart Mall Map
+  const handleDragParent = useCallback(
+    (bandId: string, rawPos: MallPoint) => {
+      const pos = clampMallPoint(rawPos);
+      updateAndPublishBand(bandId, (prev) =>
+        applyPositionEvaluation(prev, prev.childPos, pos, {
+          addSteps: 0,
+          appendTrail: false,
+        })
+      );
+    },
+    [updateAndPublishBand]
+  );
 
-        if (zoneInfo.nearGate) {
-          // Always generate a fresh alertId if not currently showing an unacknowledged GATE alert
-          if (
-            !activeAlert ||
-            activeAlert.acknowledged ||
-            activeAlert.type !== 'GATE_PROXIMITY'
-          ) {
-            activeAlert = {
-              alertId: createNewAlertId(),
-              type: 'GATE_PROXIMITY',
-              title: 'تحذير: الطفل يقترب من بوابة الخروج',
-              locationLabel: 'بوابة الخروج',
-              distanceM: dist,
-              ts: Date.now(),
-              acknowledged: false,
-              securityNotified: false,
-            };
-          } else {
-            activeAlert = { ...activeAlert, distanceM: dist };
-          }
-        } else if (dist > prev.safeLimitM) {
-          // Trigger fresh repeatable alert if previous was cleared/acknowledged or moved 2m further
-          if (
-            !activeAlert ||
-            activeAlert.acknowledged ||
-            (activeAlert.type !== 'TAMPER_ATTEMPT' &&
-              activeAlert.type !== 'DISTANCE_BREACH')
-          ) {
-            activeAlert = {
-              alertId: createNewAlertId(),
-              type: 'DISTANCE_BREACH',
-              title: `تنبيه: ابتعد السوار مسافة ${dist.toFixed(1)} متر`,
-              locationLabel: 'خارج النطاق',
-              distanceM: dist,
-              ts: Date.now(),
-              acknowledged: false,
-              securityNotified: false,
-            };
-          } else if (activeAlert.type === 'DISTANCE_BREACH') {
-            activeAlert = {
-              ...activeAlert,
-              title: `تنبيه: ابتعد السوار مسافة ${dist.toFixed(1)} متر`,
-              distanceM: dist,
-            };
-          }
-        } else if (activeAlert && activeAlert.type !== 'TAMPER_ATTEMPT') {
-          // Child returned inside safe ring: cleanly clear distance/gate alert so next exit re-fires
-          activeAlert = null;
+  // 8-Direction D-Pad Step
+  const handleStepDirection = useCallback(
+    (bandId: string, dxM: number, dyM: number) => {
+      stopScenarioAnimation();
+      void playShortChime('step');
+      updateAndPublishBand(bandId, (prev) => {
+        const nextChild = clampMallPoint({
+          x: prev.childPos.x + dxM,
+          y: prev.childPos.y + dyM,
+        });
+        const headingDeg = Math.round(
+          ((Math.atan2(dxM, -dyM) * 180) / Math.PI + 360) % 360
+        );
+        return applyPositionEvaluation(prev, nextChild, prev.parentPos, {
+          addSteps: 2,
+          headingDeg,
+          appendTrail: true,
+        });
+      });
+    },
+    [stopScenarioAnimation, updateAndPublishBand]
+  );
+
+  // Regular +1m Step outward along current heading
+  const handleRegularStep = useCallback(
+    (bandId: string) => {
+      stopScenarioAnimation();
+      void playShortChime('step');
+      updateAndPublishBand(bandId, (prev) => {
+        const rad = (prev.headingDeg * Math.PI) / 180;
+        const dx = Math.sin(rad) * 1.0;
+        const dy = -Math.cos(rad) * 1.0;
+        const nextChild = clampMallPoint({
+          x: prev.childPos.x + dx,
+          y: prev.childPos.y + dy,
+        });
+        return applyPositionEvaluation(prev, nextChild, prev.parentPos, {
+          addSteps: 1,
+          appendTrail: true,
+        });
+      });
+    },
+    [stopScenarioAnimation, updateAndPublishBand]
+  );
+
+  // 1-Click Smooth Animated Jury Demo Scenarios (Deterministic Waypoints!)
+  const handleRunScenario = useCallback(
+    (bandId: string, scenario: ScenarioId) => {
+      const band = sessionsRef.current[bandId];
+      if (!band || band.isReturned) return;
+
+      stopScenarioAnimation();
+      setActiveScenario(scenario);
+
+      // Compute clean deterministic architectural waypoints based on current parentPos & safeLimitM
+      const p = band.parentPos;
+      let waypoints: MallPoint[] = [];
+
+      if (scenario === 'kids_arena') {
+        // Walk smoothly along corridor into Kids Arena staying Green/Safe inside safeLimitM
+        const desired = { x: 64, y: 21 };
+        const dx = desired.x - p.x;
+        const dy = desired.y - p.y;
+        const d = Math.hypot(dx, dy);
+        const maxSafe = Math.max(4, band.safeLimitM - 1.4);
+        const target: MallPoint =
+          d > maxSafe && d > 0
+            ? clampMallPoint({
+                x: p.x + (dx / d) * maxSafe,
+                y: p.y + (dy / d) * maxSafe,
+              })
+            : desired;
+        waypoints = [
+          clampMallPoint({ x: (band.childPos.x + target.x) / 2, y: 28 }),
+          target,
+        ];
+        addToast('info', 'بدء سيناريو: تمشية آمنة لمنطقة الألعاب');
+      } else if (scenario === 'breach_safe') {
+        // Walk smoothly into upper-left Food Court cleanly past safeLimitM (away from perimeter gates!)
+        const breachDist = Math.min(34, band.safeLimitM + 6.5);
+        const angleRad = (-140 * Math.PI) / 180; // Toward Food Court (top-left)
+        const target = clampMallPoint({
+          x: Math.max(14, Math.min(86, p.x + Math.cos(angleRad) * breachDist)),
+          y: Math.max(12, Math.min(52, p.y + Math.sin(angleRad) * breachDist)),
+        });
+        waypoints = [
+          clampMallPoint({ x: Math.max(24, p.x - 8), y: Math.max(20, p.y - 6) }),
+          target,
+        ];
+        addToast('warning', 'بدء سيناريو: ابتعاد وتجاوز نطاق الأمان');
+      } else if (scenario === 'return_parent') {
+        // Walk child straight back inside Parent's safe circle -> triggers AUTOMATIC ALARM SHUTOFF!
+        const target = clampMallPoint({
+          x: p.x + 2.8,
+          y: p.y - 1.2,
+        });
+        waypoints = [target];
+        addToast('success', 'بدء سيناريو: عودة الطفل لولي الأمر');
+      } else if (scenario === 'gate_danger') {
+        // Walk smoothly along main east corridor right up to Gate 2 glowing laser!
+        const gate2 = MALL_GATES.find((g) => g.id === 2)!;
+        waypoints = [
+          { x: Math.max(band.childPos.x, 66), y: 32 },
+          gate2.approachPoint,
+        ];
+        addToast('error', 'بدء سيناريو: اقتراب خطير من بوابة الخروج 2');
+      }
+
+      let wpIndex = 0;
+
+      scenarioTimerRef.current = window.setInterval(() => {
+        const curBand = sessionsRef.current[bandId];
+        if (!curBand || curBand.isReturned || wpIndex >= waypoints.length) {
+          stopScenarioAnimation();
+          return;
         }
 
-        const nextHistory = [...prev.pathHistory.slice(-45), nextCoords];
+        const goal = waypoints[wpIndex];
+        const dx = goal.x - curBand.childPos.x;
+        const dy = goal.y - curBand.childPos.y;
+        const distToGoal = Math.hypot(dx, dy);
+        const stepSize = 1.45; // smooth 1.45m per 150ms tick
 
-        return {
-          ...prev,
-          childCoords: nextCoords,
-          pathHistory: nextHistory,
-          steps: prev.steps + opts.addSteps,
-          headingDeg: opts.headingDeg ?? prev.headingDeg,
-          distanceMeters: dist,
-          gpsSource: opts.source,
-          currentZoneLabel: zoneInfo.label,
-          activeAlert,
-        };
-      });
-    },
-    [updateAndPublishBand]
-  );
+        let nextPos: MallPoint;
+        if (distToGoal <= stepSize) {
+          nextPos = goal;
+          wpIndex += 1;
+        } else {
+          nextPos = clampMallPoint({
+            x: curBand.childPos.x + (dx / distToGoal) * stepSize,
+            y: curBand.childPos.y + (dy / distToGoal) * stepSize,
+          });
+        }
 
-  // Parent GPS updates Parent anchor & Virtual Gate smoothly if parent moves
-  const handleUpdateParentGps = useCallback(
-    (bandId: string, coords: LatLngTuple) => {
-      updateAndPublishBand(bandId, (prev) => {
-        const zoneInfo = deriveZoneLabel(
-          prev.childCoords,
-          coords,
-          prev.gateCoords,
-          prev.safeLimitM
+        const headingDeg = Math.round(
+          ((Math.atan2(dx, -dy) * 180) / Math.PI + 360) % 360
         );
-        return {
-          ...prev,
-          parentCoords: coords,
-          distanceMeters: zoneInfo.distParent,
-          currentZoneLabel: zoneInfo.label,
-        };
-      });
+
+        updateAndPublishBand(bandId, (prev) =>
+          applyPositionEvaluation(prev, nextPos, prev.parentPos, {
+            addSteps: 2,
+            headingDeg,
+            appendTrail: true,
+          })
+        );
+
+        if (wpIndex >= waypoints.length) {
+          stopScenarioAnimation();
+        }
+      }, 150);
     },
-    [updateAndPublishBand]
+    [stopScenarioAnimation, updateAndPublishBand, addToast]
   );
 
-  // Repeatable Gate Proximity Trigger (ALWAYS generates brand-new unique alertId!)
-  const handleTriggerGate = useCallback(
+  // Clear Footsteps Trail on Map
+  const handleClearTrail = useCallback(
     (bandId: string) => {
-      updateAndPublishBand(bandId, (prev) => {
-        const gatePos = prev.gateCoords;
-        const zoneInfo = deriveZoneLabel(
-          gatePos,
-          prev.parentCoords,
-          prev.gateCoords,
-          prev.safeLimitM
-        );
-        return {
-          ...prev,
-          childCoords: gatePos,
-          pathHistory: [...prev.pathHistory.slice(-45), gatePos],
-          steps: prev.steps + 8,
-          distanceMeters: zoneInfo.distParent,
-          currentZoneLabel: 'بوابة الخروج',
-          activeAlert: {
-            alertId: createNewAlertId(),
-            type: 'GATE_PROXIMITY',
-            title: 'تحذير: الطفل يقترب من بوابة الخروج',
-            locationLabel: 'بوابة الخروج',
-            distanceM: zoneInfo.distParent,
-            ts: Date.now(),
-            acknowledged: false,
-            securityNotified: false,
-          },
-        };
-      });
-      addToast('error', 'تم إرسال تنبيه بوابة الخروج');
+      updateAndPublishBand(bandId, (prev) => ({
+        ...prev,
+        pathHistory: [prev.childPos],
+      }));
+      addToast('info', 'تم مسح مسار الخطوات');
     },
     [updateAndPublishBand, addToast]
   );
 
-  // Repeatable Tamper Trigger (ALWAYS generates brand-new unique alertId!)
+  // Safe Radius Slider (10m - 35m) with live auto-recovery / breach evaluation
+  const handleChangeSafeLimit = useCallback(
+    (bandId: string, safeLimitM: number) => {
+      updateAndPublishBand(bandId, (prev) => {
+        const withRadius: LiveBandState = { ...prev, safeLimitM };
+        return applyPositionEvaluation(
+          withRadius,
+          withRadius.childPos,
+          withRadius.parentPos,
+          { addSteps: 0, appendTrail: false }
+        );
+      });
+    },
+    [updateAndPublishBand]
+  );
+
+  // Battery Slider (10% - 100%)
+  const handleChangeBattery = useCallback(
+    (bandId: string, batteryPct: number) => {
+      updateAndPublishBand(bandId, (prev) => ({
+        ...prev,
+        batteryPct: Math.max(10, Math.min(100, Math.round(batteryPct))),
+      }));
+    },
+    [updateAndPublishBand]
+  );
+
+  // Unauthorized Clasp Tamper Alert
   const handleTriggerTamper = useCallback(
     (bandId: string) => {
+      stopScenarioAnimation();
       updateAndPublishBand(bandId, (prev) => {
-        const zoneInfo = deriveZoneLabel(
-          prev.childCoords,
-          prev.parentCoords,
-          prev.gateCoords,
+        const evalInfo = evaluateMallPosition(
+          prev.childPos,
+          prev.parentPos,
           prev.safeLimitM
         );
         return {
           ...prev,
+          lockStatus: 'tampered',
           activeAlert: {
             alertId: createNewAlertId(),
             type: 'TAMPER_ATTEMPT',
-            title: 'تحذير: محاولة فك السوار بدون إذن',
-            locationLabel: zoneInfo.label,
-            distanceM: zoneInfo.distParent,
+            title: 'إنذار أمني: محاولة فتح قفل السوار بدون تصريح',
+            locationLabel: evalInfo.zoneName,
+            distanceM: evalInfo.distParent,
             ts: Date.now(),
             acknowledged: false,
             securityNotified: false,
           },
         };
       });
-      addToast('error', 'تم إرسال تنبيه محاولة فك السوار');
+      addToast('error', 'تم إطلاق إنذار محاولة فك السوار');
     },
-    [updateAndPublishBand, addToast]
+    [stopScenarioAnimation, updateAndPublishBand, addToast]
   );
 
-  // 1-Tap Jury Demo Reset (re-centers child next to parent, clears trail & alerts, keeps session active!)
-  const handleDemoReset = useCallback(
+  // Confirm Clasp Secured -> immediately syncs silence across devices
+  const handleSecureClasp = useCallback(
     (bandId: string) => {
-      updateAndPublishBand(bandId, (prev) => {
-        const startChild = offsetLatLng(prev.parentCoords, 1.4, 1.1);
-        const gateCoords = computeGateCoords(prev.parentCoords);
-        const zoneInfo = deriveZoneLabel(
-          startChild,
-          prev.parentCoords,
-          gateCoords,
-          prev.safeLimitM
-        );
-        return {
-          ...prev,
-          childCoords: startChild,
-          gateCoords,
-          pathHistory: [prev.parentCoords, startChild],
-          steps: 0,
-          headingDeg: 45,
-          distanceMeters: zoneInfo.distParent,
-          currentZoneLabel: 'النطاق الآمن',
-          activeAlert: null,
-        };
-      });
+      updateAndPublishBand(bandId, (prev) => ({
+        ...prev,
+        lockStatus: 'locked',
+        activeAlert:
+          prev.activeAlert?.type === 'TAMPER_ATTEMPT'
+            ? null
+            : prev.activeAlert,
+        recoveryNotice: {
+          id: createNewAlertId(),
+          kind: 'tamper',
+          text: 'تم تأكيد تأمين القفل الإلكتروني — توقف الإنذار',
+          ts: Date.now(),
+        },
+      }));
       void playShortChime('lock');
-      addToast('success', 'تمت إعادة ضبط المسار');
+      addToast('success', 'تم تأكيد تأمين القفل الإلكتروني');
     },
     [updateAndPublishBand, addToast]
   );
 
-  const handleChangeSafeLimit = useCallback(
-    (bandId: string, safeLimitM: number) => {
-      updateAndPublishBand(bandId, (prev) => ({ ...prev, safeLimitM }));
-      addToast('info', `نطاق الأمان ${safeLimitM} متر`);
-    },
-    [updateAndPublishBand, addToast]
-  );
-
-  // Acknowledge ONLY that exact alertId so next triggers always fire cleanly
+  // Acknowledge Distance/Gate Alert on Parent Phone
   const handleAcknowledgeAlert = useCallback(
     (bandId: string, alertId: number) => {
       updateAndPublishBand(bandId, (prev) => {
@@ -542,11 +754,12 @@ export default function App() {
           activeAlert: { ...prev.activeAlert, acknowledged: true },
         };
       });
-      addToast('info', 'تم إيقاف الإنذار');
+      addToast('info', 'تم إيقاف صوت الإنذار');
     },
     [updateAndPublishBand, addToast]
   );
 
+  // Notify Mall Security from Parent Phone
   const handleNotifySecurity = useCallback(
     (bandId: string, alertId: number) => {
       updateAndPublishBand(bandId, (prev) => {
@@ -558,12 +771,43 @@ export default function App() {
           activeAlert: { ...prev.activeAlert, securityNotified: true },
         };
       });
-      addToast('error', 'تم إبلاغ الأمن فوراً');
+      addToast('error', 'تم إبلاغ أمن المول فوراً');
     },
     [updateAndPublishBand, addToast]
   );
 
-  // Official Return & Unlock via 4-Digit PIN
+  // Comprehensive Reset for Next Jury Demo
+  const handleFullReset = useCallback(
+    (bandId: string) => {
+      stopScenarioAnimation();
+      updateAndPublishBand(bandId, (prev) => {
+        const parentPos = { ...DEFAULT_PARENT_POS };
+        const childPos = { ...DEFAULT_CHILD_POS };
+        const evalInfo = evaluateMallPosition(childPos, parentPos, 15);
+        return {
+          ...prev,
+          parentPos,
+          childPos,
+          pathHistory: [parentPos, childPos],
+          steps: 0,
+          headingDeg: 45,
+          safeLimitM: 15,
+          batteryPct: 98,
+          lockStatus: 'locked',
+          distanceMeters: evalInfo.distParent,
+          currentZoneLabel: evalInfo.zoneName,
+          nearGateNumber: null,
+          activeAlert: null,
+          recoveryNotice: null,
+        };
+      });
+      void playShortChime('lock');
+      addToast('success', 'تمت إعادة الضبط الشاملة للتجربة التالية');
+    },
+    [stopScenarioAnimation, updateAndPublishBand, addToast]
+  );
+
+  // Official Return via 4-Digit Security PIN
   const handleUnlockAndReturn = useCallback(
     (bandId: string, pin: string): boolean => {
       const target = sessions[bandId];
@@ -571,141 +815,200 @@ export default function App() {
 
       if (pin !== target.pinCode) {
         void playShortChime('denied');
-        handleTriggerTamper(bandId);
         return false;
       }
 
-      void playShortChime('unlock');
-      liveSync.publishReturnAndClearRetained(target);
+      stopScenarioAnimation();
+      const returnedAt = Date.now();
+      const record: ReturnedBandRecord = {
+        bandId: target.bandId,
+        childName: target.childName,
+        returnedAt,
+      };
 
+      void playShortChime('unlock');
+      liveSync.publishReturnState(target);
+
+      setReturnedHistory((prev) => ({ ...prev, [record.bandId]: record }));
       setSessions((prev) => {
         const next = { ...prev };
         delete next[bandId];
-        saveActiveSessions(next);
         return next;
       });
-
-      setReturnedCount((c) => {
-        const next = c + 1;
-        saveReturnedCount(next);
-        return next;
-      });
-
-      setLastReturnedInfo({
-        bandId: target.bandId,
-        childName: target.childName,
-      });
+      setReturnedCount((c) => c + 1);
+      setLastReturnedInfo(record);
 
       const remaining = activeBands.filter((b) => b.bandId !== bandId);
-      updateDeviceRole({
-        role: 'booth',
-        activeBandId: remaining[0]?.bandId ?? '',
-      });
+      setSelectedBandId(remaining[0]?.bandId ?? '');
 
       addToast('success', 'تم فك القفل وتسليم السوار بنجاح');
       return true;
     },
-    [sessions, activeBands, handleTriggerTamper, updateDeviceRole, addToast]
+    [sessions, activeBands, stopScenarioAnimation, addToast]
   );
 
-  const handleAdminExitToBooth = useCallback(() => {
-    const firstActiveId = activeBands[0]?.bandId ?? '';
-    updateDeviceRole({ role: 'booth', activeBandId: firstActiveId });
-    setBoothTab('console');
-    setLastReturnedInfo(null);
+  const handleOpenMainDashboard = useCallback(() => {
+    setScanMode('none');
+    setScanBandId('');
+    setActiveTab('booth');
     if (window.location.search) {
       window.history.replaceState(null, '', window.location.pathname);
     }
-  }, [activeBands, updateDeviceRole]);
+    // Ensure demo band exists if user jumps from a fresh phone into Booth
+    if (Object.keys(sessionsRef.current).length === 0) {
+      const demo = createDemoBand(CLIENT_ID);
+      setSessions({ [demo.bandId]: demo });
+      setSelectedBandId(demo.bandId);
+      liveSync.publishState(demo);
+    }
+  }, []);
 
-  // ROUTE 1: STRICTLY ISOLATED PARENT LOCKED VIEW (?role=parent&b=XXXX or ?b=XXXX)
-  if (deviceRole.role === 'parent' && deviceRole.activeBandId) {
-    const boundBand = sessions[deviceRole.activeBandId] ?? null;
+  const currentBand =
+    sessions[selectedBandId] ?? activeBands[0] ?? null;
+
+  // DEDICATED SCANNED PARENT QR EXPERIENCE (?p=BAND_ID)
+  if (scanMode === 'parent' && scanBandId) {
+    const scannedBand = sessions[scanBandId] ?? null;
+    const matchedReturned =
+      returnedHistory[scanBandId] ??
+      (lastReturnedInfo?.bandId === scanBandId ? lastReturnedInfo : null);
     return (
-      <>
+      <div className="min-h-screen">
         <ParentTab
-          band={boundBand}
-          lockedBandId={deviceRole.activeBandId}
-          returnedBandInfo={lastReturnedInfo}
+          band={scannedBand}
+          lockedBandId={scanBandId}
+          returnedBandInfo={matchedReturned}
           syncStatus={syncStatus}
-          onUpdateParentGps={handleUpdateParentGps}
+          isQrScanMode
+          onDragParent={handleDragParent}
           onAcknowledgeAlert={handleAcknowledgeAlert}
+          onSecureClasp={handleSecureClasp}
           onNotifySecurity={handleNotifySecurity}
-          onAdminExit={handleAdminExitToBooth}
+          onOpenMainDashboard={handleOpenMainDashboard}
         />
         <ToastStack
           toasts={toasts}
           onDismiss={(id) => setToasts((p) => p.filter((t) => t.id !== id))}
         />
-      </>
+      </div>
     );
   }
 
-  // ROUTE 2: STRICTLY ISOLATED CHILD SMART WRISTBAND VIEW (?role=band&b=XXXX or ?w=XXXX)
-  if (deviceRole.role === 'band' && deviceRole.activeBandId) {
-    const boundBand = sessions[deviceRole.activeBandId] ?? null;
+  // DEDICATED SCANNED WRISTBAND QR EXPERIENCE (?w=BAND_ID) — ALWAYS HAS RETURN TO BOOTH!
+  if (scanMode === 'band' && scanBandId) {
+    const scannedBand = sessions[scanBandId] ?? null;
+    const matchedReturned =
+      returnedHistory[scanBandId] ??
+      (lastReturnedInfo?.bandId === scanBandId ? lastReturnedInfo : null);
     return (
-      <>
+      <div className="min-h-screen">
         <BandWearableView
-          band={boundBand}
-          lockedBandId={deviceRole.activeBandId}
-          returnedBandInfo={lastReturnedInfo}
+          band={scannedBand}
+          lockedBandId={scanBandId}
+          returnedBandInfo={matchedReturned}
           syncStatus={syncStatus}
-          onMoveChild={handleMoveChild}
-          onTriggerGate={handleTriggerGate}
+          activeScenario={activeScenario}
+          onRunScenario={handleRunScenario}
+          onStepDirection={handleStepDirection}
+          onRegularStep={handleRegularStep}
+          onDragChild={handleDragChild}
+          onDragParent={handleDragParent}
+          onClearTrail={handleClearTrail}
+          onChangeSafeLimit={handleChangeSafeLimit}
+          onChangeBattery={handleChangeBattery}
           onTriggerTamper={handleTriggerTamper}
-          onDemoReset={handleDemoReset}
-          onAdminExit={handleAdminExitToBooth}
+          onSecureClasp={handleSecureClasp}
+          onFullReset={handleFullReset}
+          onReturnToBooth={handleOpenMainDashboard}
         />
         <ToastStack
           toasts={toasts}
           onDismiss={(id) => setToasts((p) => p.filter((t) => t.id !== id))}
         />
-      </>
+      </div>
     );
   }
 
-  // ROUTE 3: SECURITY / BOOTH CONSOLE (Default /)
+  // MAIN APP (/) — ALWAYS SHOWS FULL 4-TAB FROSTED GLASS NAVIGATION BAR (ZERO TRAPS!)
   return (
     <div className="min-h-screen">
       <TopNav
-        activeTab={boothTab}
-        onSelectTab={setBoothTab}
+        activeTab={activeTab}
+        onSelectTab={setActiveTab}
         syncStatus={syncStatus}
         activeCount={activeBands.length}
       />
 
       <main>
-        {boothTab === 'console' && (
+        {activeTab === 'booth' && (
           <BoothTab
             activeBands={activeBands}
-            selectedBandId={deviceRole.activeBandId}
+            selectedBandId={currentBand?.bandId ?? ''}
             returnedCount={returnedCount}
             lastReturnedInfo={lastReturnedInfo}
             baseUrl={baseUrl}
+            activeScenario={activeScenario}
             onChangeBaseUrl={handleChangeBaseUrl}
-            onSelectBand={(id) =>
-              updateDeviceRole({ role: 'booth', activeBandId: id })
-            }
+            onSelectBand={setSelectedBandId}
             onCreateBand={handleCreateBand}
+            onRunScenario={handleRunScenario}
+            onStepDirection={handleStepDirection}
+            onRegularStep={handleRegularStep}
+            onDragChild={handleDragChild}
+            onDragParent={handleDragParent}
+            onClearTrail={handleClearTrail}
             onChangeSafeLimit={handleChangeSafeLimit}
-            onMoveChild={handleMoveChild}
-            onTriggerGate={handleTriggerGate}
+            onChangeBattery={handleChangeBattery}
             onTriggerTamper={handleTriggerTamper}
-            onDemoReset={handleDemoReset}
+            onSecureClasp={handleSecureClasp}
+            onFullReset={handleFullReset}
             onUnlockAndReturn={handleUnlockAndReturn}
-            onLaunchLockedRole={(role, bandId) => {
-              updateDeviceRole({ role, activeBandId: bandId });
-            }}
+            onOpenPreviewTab={(tab) => setActiveTab(tab)}
             onDismissReturnedBanner={() => setLastReturnedInfo(null)}
           />
         )}
 
-        {boothTab === 'print' && (
+        {activeTab === 'parent' && (
+          <ParentTab
+            band={currentBand}
+            lockedBandId={currentBand?.bandId ?? ''}
+            returnedBandInfo={lastReturnedInfo}
+            syncStatus={syncStatus}
+            isQrScanMode={false}
+            onDragParent={handleDragParent}
+            onAcknowledgeAlert={handleAcknowledgeAlert}
+            onSecureClasp={handleSecureClasp}
+            onNotifySecurity={handleNotifySecurity}
+          />
+        )}
+
+        {activeTab === 'band' && (
+          <BandWearableView
+            band={currentBand}
+            lockedBandId={currentBand?.bandId ?? ''}
+            returnedBandInfo={lastReturnedInfo}
+            syncStatus={syncStatus}
+            activeScenario={activeScenario}
+            onRunScenario={handleRunScenario}
+            onStepDirection={handleStepDirection}
+            onRegularStep={handleRegularStep}
+            onDragChild={handleDragChild}
+            onDragParent={handleDragParent}
+            onClearTrail={handleClearTrail}
+            onChangeSafeLimit={handleChangeSafeLimit}
+            onChangeBattery={handleChangeBattery}
+            onTriggerTamper={handleTriggerTamper}
+            onSecureClasp={handleSecureClasp}
+            onFullReset={handleFullReset}
+            onReturnToBooth={() => setActiveTab('booth')}
+          />
+        )}
+
+        {activeTab === 'print' && (
           <PrintQrTab
             baseUrl={baseUrl}
             onChangeBaseUrl={handleChangeBaseUrl}
-            defaultBandId={deviceRole.activeBandId || activeBands[0]?.bandId}
+            defaultBandId={currentBand?.bandId}
           />
         )}
       </main>

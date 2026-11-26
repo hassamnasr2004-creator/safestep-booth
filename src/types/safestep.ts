@@ -1,14 +1,10 @@
 export type BandEditionId = 'batman' | 'spider' | 'astro' | 'frost';
 
-export type LatLngTuple = [number, number];
+export type MainTabId = 'booth' | 'parent' | 'band' | 'print';
 
-export type BoothTabId = 'console' | 'print';
-
-export type DeviceRole = 'parent' | 'band' | 'booth';
-
-export interface StoredDeviceRole {
-  role: DeviceRole;
-  activeBandId: string;
+export interface MallPoint {
+  x: number; // 0..100 meters
+  y: number; // 0..64 meters
 }
 
 export interface BandEdition {
@@ -27,10 +23,18 @@ export interface LiveAlert {
   type: AlertKind;
   title: string;
   locationLabel: string;
+  gateNumber?: number;
   distanceM: number;
   ts: number;
   acknowledged: boolean;
   securityNotified: boolean;
+}
+
+export interface RecoveryNotice {
+  id: number;
+  kind: 'distance' | 'gate' | 'tamper';
+  text: string;
+  ts: number;
 }
 
 export interface LiveBandState {
@@ -39,29 +43,48 @@ export interface LiveBandState {
   editionId: BandEditionId;
   guardianPhone: string;
   pinCode: string;
-  lockStatus: 'locked' | 'unlocked';
+  lockStatus: 'locked' | 'tampered' | 'unlocked';
+  batteryPct: number;
   isReturned: boolean;
+  returnedAt?: number;
   safeLimitM: number;
   createdAt: number;
   lastUpdated: number;
   eventId: number;
   senderId: string;
-  originCoords: LatLngTuple;
-  parentCoords: LatLngTuple;
-  childCoords: LatLngTuple;
-  gateCoords: LatLngTuple;
-  pathHistory: LatLngTuple[];
+  parentPos: MallPoint;
+  childPos: MallPoint;
+  pathHistory: MallPoint[];
   steps: number;
   headingDeg: number;
   distanceMeters: number;
-  gpsSource: 'gps' | 'fusion';
   currentZoneLabel: string;
+  nearGateNumber: number | null;
   activeAlert: LiveAlert | null;
+  recoveryNotice: RecoveryNotice | null;
+}
+
+export interface ReturnedBandRecord {
+  bandId: string;
+  childName: string;
+  returnedAt: number;
 }
 
 export type SessionDictionary = Record<string, LiveBandState>;
 
+export interface JuryStoragePayload {
+  sessions: SessionDictionary;
+  returnedHistory: Record<string, ReturnedBandRecord>;
+  returnedCount: number;
+}
+
 export type SyncStatus = 'connecting' | 'connected' | 'failover' | 'local';
+
+export type ScenarioId =
+  | 'kids_arena'
+  | 'breach_safe'
+  | 'return_parent'
+  | 'gate_danger';
 
 export interface ToastMessage {
   id: string;

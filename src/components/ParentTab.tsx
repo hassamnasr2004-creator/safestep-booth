@@ -1,11 +1,13 @@
 import { useEffect, useRef, useState } from 'react';
 import {
+  BatteryCharging,
   BellRing,
   Check,
   CheckCircle2,
   Footprints,
   KeyRound,
-  LocateFixed,
+  LayoutDashboard,
+  Lock,
   MapPin,
   Radio,
   ShieldAlert,
@@ -13,26 +15,37 @@ import {
   Volume2,
   VolumeX,
 } from 'lucide-react';
-import { LatLngTuple, LiveBandState, SyncStatus } from '../types/safestep';
-import { deriveZoneLabel, getEditionById } from '../data/safestepData';
 import {
+  LiveBandState,
+  MallPoint,
+  ReturnedBandRecord,
+  SyncStatus,
+} from '../types/safestep';
+import {
+  evaluateMallPosition,
+  formatArabicTime,
+  getEditionById,
+} from '../data/safestepData';
+import {
+  playShortChime,
   startRepeatableAlarm,
   stopRepeatableAlarm,
   unlockPhoneAlerts,
 } from '../utils/audioAlerts';
 import { GlassIcon } from './GlassIcon';
-import { LiveLeafletMap } from './LiveLeafletMap';
-import { AdminExitCorner } from './AdminExitCorner';
+import { SmartMallMap } from './SmartMallMap';
 
 interface ParentTabProps {
   band: LiveBandState | null;
   lockedBandId: string;
-  returnedBandInfo: { bandId: string; childName: string } | null;
+  returnedBandInfo: ReturnedBandRecord | null;
   syncStatus: SyncStatus;
-  onUpdateParentGps: (bandId: string, coords: LatLngTuple) => void;
+  isQrScanMode?: boolean;
+  onDragParent?: (bandId: string, pos: MallPoint) => void;
   onAcknowledgeAlert: (bandId: string, alertId: number) => void;
+  onSecureClasp: (bandId: string) => void;
   onNotifySecurity: (bandId: string, alertId: number) => void;
-  onAdminExit: () => void;
+  onOpenMainDashboard?: () => void;
 }
 
 export function ParentTab({
@@ -40,49 +53,34 @@ export function ParentTab({
   lockedBandId,
   returnedBandInfo,
   syncStatus,
-  onUpdateParentGps,
+  isQrScanMode = false,
+  onDragParent,
   onAcknowledgeAlert,
+  onSecureClasp,
   onNotifySecurity,
-  onAdminExit,
+  onOpenMainDashboard,
 }: ParentTabProps) {
   const [alertsEnabled, setAlertsEnabled] = useState(false);
-  const [gpsActive, setGpsActive] = useState(false);
-  const watchRef = useRef<number | null>(null);
+  const [recoveryToast, setRecoveryToast] = useState<string | null>(null);
+  const [lookupExpired, setLookupExpired] = useState(false);
+
   const lastFiredAlertIdRef = useRef<number | null>(null);
+  const lastRecoveryIdRef = useRef<number | null>(null);
   const localAckedIdsRef = useRef<Set<number>>(new Set());
 
-  // Parent real GPS watchPosition
+  // If scanned QR has no active session after 5.5s, show clean returned/ended card
   useEffect(() => {
-    if (!gpsActive || !band || band.isReturned) {
-      if (watchRef.current !== null && 'geolocation' in navigator) {
-        navigator.geolocation.clearWatch(watchRef.current);
-        watchRef.current = null;
-      }
+    if (band || returnedBandInfo) {
+      setLookupExpired(false);
       return;
     }
+    const timer = window.setTimeout(() => setLookupExpired(true), 5500);
+    return () => window.clearTimeout(timer);
+  }, [band, returnedBandInfo, lockedBandId]);
 
-    if (!('geolocation' in navigator)) return;
-
-    watchRef.current = navigator.geolocation.watchPosition(
-      (pos) => {
-        onUpdateParentGps(band.bandId, [
-          Number(pos.coords.latitude.toFixed(7)),
-          Number(pos.coords.longitude.toFixed(7)),
-        ]);
-      },
-      () => {},
-      { enableHighAccuracy: true, maximumAge: 2000, timeout: 10000 }
-    );
-
-    return () => {
-      if (watchRef.current !== null && 'geolocation' in navigator) {
-        navigator.geolocation.clearWatch(watchRef.current);
-        watchRef.current = null;
-      }
-    };
-  }, [gpsActive, band?.bandId, band?.isReturned, onUpdateParentGps]);
-
-  // Repeatable Alert State Machine: triggers cleanly for EVERY new unique alertId
+  // Repeatable Alert State Machine:
+  // Fires Web Audio Siren + Vibration for every new alertId,
+  // and AUTOMATICALLY STOPS + DISMISSES the instant activeAlert clears!
   const activeAlert =
     band &&
     !band.isReturned &&
@@ -115,17 +113,47 @@ export function ParentTab({
     };
   }, [activeAlert]);
 
+  // Calm 4-second Emerald frosted-glass toast on automatic safe-zone/gate/clasp recovery
+  useEffect(() => {
+    const notice = band?.recoveryNotice;
+    if (!notice || band?.isReturned) return;
+    if (lastRecoveryIdRef.current === notice.id) return;
+    if (Date.now() - notice.ts > 20000) {
+      lastRecoveryIdRef.current = notice.id;
+      return;
+    }
+
+    lastRecoveryIdRef.current = notice.id;
+    stopRepeatableAlarm();
+    setRecoveryToast(notice.text);
+    void playShortChime('lock');
+
+    const timer = window.setTimeout(() => {
+      setRecoveryToast((cur) => (cur === notice.text ? null : cur));
+    }, 4500);
+
+    return () => window.clearTimeout(timer);
+  }, [
+    band?.recoveryNotice?.id,
+    band?.recoveryNotice?.text,
+    band?.recoveryNotice?.ts,
+    band?.isReturned,
+  ]);
+
   const handleEnablePhoneAlerts = async () => {
     await unlockPhoneAlerts();
     setAlertsEnabled(true);
-    setGpsActive(true);
   };
 
-  const handleStopAlarm = () => {
+  const handleDismissOrSecure = () => {
     stopRepeatableAlarm();
-    if (band && activeAlert) {
-      localAckedIdsRef.current.add(activeAlert.alertId);
-      lastFiredAlertIdRef.current = null;
+    if (!band || !activeAlert) return;
+    localAckedIdsRef.current.add(activeAlert.alertId);
+    lastFiredAlertIdRef.current = null;
+
+    if (activeAlert.type === 'TAMPER_ATTEMPT') {
+      onSecureClasp(band.bandId);
+    } else {
       onAcknowledgeAlert(band.bandId, activeAlert.alertId);
     }
   };
@@ -136,17 +164,13 @@ export function ParentTab({
     }
   };
 
-  const syncLabel =
-    syncStatus === 'connected'
-      ? 'بث مباشر'
-      : syncStatus === 'failover'
-      ? 'خادم احتياطي'
-      : 'مزامنة';
-
-  // Official Return Confirmation Screen
-  if (returnedBandInfo && (!band || returnedBandInfo.bandId === lockedBandId)) {
+  // Ended / Returned Wristband Confirmation Card
+  if (
+    (returnedBandInfo && (!band || returnedBandInfo.bandId === lockedBandId)) ||
+    (!band && lookupExpired)
+  ) {
     return (
-      <div className="min-h-screen flex items-center justify-center p-4">
+      <div className="min-h-[75vh] flex flex-col items-center justify-center p-4 gap-5">
         <div className="glass-panel rounded-3xl p-8 max-w-sm w-full text-center space-y-4">
           <div className="flex justify-center">
             <GlassIcon tone="safe" size="lg">
@@ -154,21 +178,36 @@ export function ParentTab({
             </GlassIcon>
           </div>
           <h1 className="text-lg font-bold text-[#0F172A] leading-snug">
-            تم فك القفل وتسليم السوار بنجاح — انتهت الجلسة
+            انتهت الجلسة وتم تسليم هذا السوار بأمان
           </h1>
           <p className="text-sm font-semibold text-[#475569] tabular-nums">
-            {returnedBandInfo.childName} · {returnedBandInfo.bandId}
+            {returnedBandInfo
+              ? `${returnedBandInfo.childName} · ${returnedBandInfo.bandId}`
+              : lockedBandId}
+          </p>
+          <p className="text-xs font-semibold text-[#059669] tabular-nums">
+            وقت التسليم: {formatArabicTime(returnedBandInfo?.returnedAt)}
           </p>
         </div>
-        <AdminExitCorner onAuthorizedExit={onAdminExit} />
+
+        {isQrScanMode && onOpenMainDashboard && (
+          <button
+            type="button"
+            onClick={onOpenMainDashboard}
+            className="px-4 py-2 rounded-full bg-white/75 hover:bg-white border border-white text-xs font-bold text-[#475569] hover:text-[#0F172A] inline-flex items-center gap-1.5 shadow-xs cursor-pointer"
+          >
+            <LayoutDashboard className="w-3.5 h-3.5" strokeWidth={2} />
+            <span>فتح اللوحة الرئيسية</span>
+          </button>
+        )}
       </div>
     );
   }
 
-  // Waiting for retained cloud state on fresh phone scan
+  // Connecting state while receiving retained snapshot on fresh phone scan
   if (!band) {
     return (
-      <div className="min-h-screen flex items-center justify-center p-4">
+      <div className="min-h-[75vh] flex flex-col items-center justify-center p-4 gap-5">
         <div className="glass-panel rounded-3xl p-8 max-w-sm w-full text-center space-y-3">
           <div className="flex justify-center">
             <GlassIcon tone="track" size="lg">
@@ -176,47 +215,83 @@ export function ParentTab({
             </GlassIcon>
           </div>
           <h1 className="text-base font-bold text-[#0F172A] tabular-nums">
-            جارٍ الاتصال بالسوار {lockedBandId}
+            {lockedBandId
+              ? `جارٍ الاتصال بالسوار ${lockedBandId}`
+              : 'لا يوجد سوار نشط حالياً'}
           </h1>
-          <p className="text-xs font-medium text-[#475569]">{syncLabel}</p>
+          <p className="text-xs font-semibold text-[#059669]">
+            {syncStatus === 'connected'
+              ? 'متصل لحظياً • إشارة قوية'
+              : 'جارٍ مزامنة البث المباشر'}
+          </p>
         </div>
-        <AdminExitCorner onAuthorizedExit={onAdminExit} />
+
+        {isQrScanMode && onOpenMainDashboard && (
+          <button
+            type="button"
+            onClick={onOpenMainDashboard}
+            className="px-4 py-2 rounded-full bg-white/75 hover:bg-white border border-white text-xs font-bold text-[#475569] hover:text-[#0F172A] inline-flex items-center gap-1.5 shadow-xs cursor-pointer"
+          >
+            <LayoutDashboard className="w-3.5 h-3.5" strokeWidth={2} />
+            <span>فتح اللوحة الرئيسية</span>
+          </button>
+        )}
       </div>
     );
   }
 
   const edition = getEditionById(band.editionId);
-  const zoneInfo = deriveZoneLabel(
-    band.childCoords,
-    band.parentCoords,
-    band.gateCoords,
+  const evalInfo = evaluateMallPosition(
+    band.childPos,
+    band.parentPos,
     band.safeLimitM
   );
-  const dist = zoneInfo.distParent;
+  const dist = evalInfo.distParent;
 
   const isCritical =
     band.activeAlert?.type === 'TAMPER_ATTEMPT' ||
     band.activeAlert?.type === 'GATE_PROXIMITY' ||
-    zoneInfo.nearGate ||
-    dist > band.safeLimitM;
-  const isWarn = !isCritical && dist > band.safeLimitM * 0.7;
+    evalInfo.nearGate ||
+    evalInfo.outsideSafe;
+  const isWarn = !isCritical && dist > band.safeLimitM * 0.72;
 
   const statusLabel =
     band.activeAlert?.type === 'TAMPER_ATTEMPT'
       ? 'محاولة فك'
-      : zoneInfo.nearGate || band.activeAlert?.type === 'GATE_PROXIMITY'
-      ? 'خطر بوابة'
-      : dist > band.safeLimitM
+      : evalInfo.nearGate && evalInfo.nearestGate
+      ? `خطر بوابة ${evalInfo.nearestGate.id}`
+      : evalInfo.outsideSafe
       ? 'خارج النطاق'
       : isWarn
       ? 'قرب الحد'
       : 'آمن';
 
   const statusTone = isCritical ? 'alert' : isWarn ? 'warn' : 'safe';
+  const isTampered =
+    band.lockStatus === 'tampered' ||
+    band.activeAlert?.type === 'TAMPER_ATTEMPT';
 
   return (
-    <div className="min-h-screen pb-14">
-      {/* FULL-SCREEN REPEATABLE FROSTED RED ALERT OVERLAY */}
+    <div className="pb-10">
+      {/* CALM EMERALD AUTO-RECOVERY FROSTED TOAST */}
+      {recoveryToast && !activeAlert && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed top-4 inset-x-4 z-40 flex justify-center pointer-events-none"
+        >
+          <div className="pointer-events-auto max-w-md w-full px-4 py-3.5 rounded-2xl bg-[#ECFDF5]/95 backdrop-blur-xl border border-[#10B981]/55 shadow-[0_12px_36px_rgba(16,185,129,0.22)] flex items-center gap-3">
+            <GlassIcon tone="safe" size="sm">
+              <CheckCircle2 className="w-4 h-4" strokeWidth={2.2} />
+            </GlassIcon>
+            <p className="text-xs sm:text-sm font-bold text-[#065F46] leading-snug">
+              {recoveryToast}
+            </p>
+          </div>
+        </div>
+      )}
+
+      {/* FULL-SCREEN FROSTED RED ALERT OVERLAY (Auto-dismisses when child returns to safety!) */}
       {activeAlert && (
         <div
           role="alertdialog"
@@ -240,13 +315,13 @@ export function ParentTab({
             <div className="grid grid-cols-2 gap-3 pt-1">
               <div className="bg-black/20 backdrop-blur-md border border-white/15 rounded-2xl p-4">
                 <p className="text-xs opacity-85">الموقع الحالي</p>
-                <p className="text-lg font-bold mt-1">
+                <p className="text-base sm:text-lg font-bold mt-1">
                   {activeAlert.locationLabel}
                 </p>
               </div>
               <div className="bg-black/20 backdrop-blur-md border border-white/15 rounded-2xl p-4">
                 <p className="text-xs opacity-85">المسافة</p>
-                <p className="text-lg font-bold mt-1 tabular-nums">
+                <p className="text-base sm:text-lg font-bold mt-1 tabular-nums">
                   {activeAlert.distanceM.toFixed(1)} متر
                 </p>
               </div>
@@ -271,32 +346,41 @@ export function ParentTab({
 
             <button
               type="button"
-              onClick={handleStopAlarm}
+              onClick={handleDismissOrSecure}
               className="w-full py-4 px-5 bg-white hover:bg-slate-50 text-[#DC2626] text-base font-bold rounded-2xl inline-flex items-center justify-center gap-2 transition-all duration-200 cursor-pointer"
             >
-              <VolumeX className="w-5 h-5" strokeWidth={2} />
-              <span>تم الانتباه وإيقاف الإنذار</span>
+              {activeAlert.type === 'TAMPER_ATTEMPT' ? (
+                <>
+                  <Lock className="w-5 h-5" strokeWidth={2} />
+                  <span>تأكيد تأمين القفل</span>
+                </>
+              ) : (
+                <>
+                  <VolumeX className="w-5 h-5" strokeWidth={2} />
+                  <span>تم الانتباه وإيقاف الصوت</span>
+                </>
+              )}
             </button>
           </div>
         </div>
       )}
 
-      {/* LOCKED PARENT SCREEN CONTENT (Zero Booth Navigation / Zero Simulator Controls) */}
-      <div className="max-w-2xl mx-auto px-4 pt-4 space-y-3.5">
-        {/* Compact Frosted Header */}
-        <header className="glass-card rounded-2xl px-4 py-3 flex items-center justify-between gap-3">
+      {/* DEDICATED PARENT MOBILE TRACKER CONTENT */}
+      <div className="max-w-3xl mx-auto px-4 pt-4 space-y-4">
+        {/* Compact Frosted Child Identity Header */}
+        <header className="glass-panel rounded-2xl px-4 py-3 flex items-center justify-between gap-3">
           <div className="flex items-center gap-3 min-w-0">
             <img
               src={edition.imageUrl}
               alt={edition.shortName}
-              className="w-11 h-11 rounded-xl object-cover border border-white shadow-sm shrink-0"
+              className="w-11 h-11 rounded-xl object-cover border border-white shadow-xs shrink-0"
             />
             <div className="min-w-0">
               <h1 className="text-base font-bold text-[#0F172A] truncate">
                 {band.childName}
               </h1>
               <p className="text-[11px] font-semibold text-[#475569] tabular-nums">
-                {band.bandId} · {edition.shortName}
+                {band.bandId} · {edition.shortName} · النطاق {band.safeLimitM}م
               </p>
             </div>
           </div>
@@ -313,25 +397,18 @@ export function ParentTab({
             >
               {statusLabel}
             </span>
-            <span className="text-[10px] font-semibold text-[#059669] inline-flex items-center gap-1">
-              <ShieldCheck className="w-3 h-3" strokeWidth={2} />
-              <span>{syncLabel}</span>
+            <span className="text-[10px] font-bold text-[#059669] inline-flex items-center gap-1">
+              <span className="w-1.5 h-1.5 rounded-full bg-[#10B981]" />
+              <span>
+                {syncStatus === 'connected'
+                  ? 'متصل لحظياً • إشارة قوية'
+                  : 'مزامنة مباشرة'}
+              </span>
             </span>
           </div>
         </header>
 
-        {/* Auto-Saved Indicator */}
-        <div className="px-1 flex items-center justify-between text-[11px] font-semibold text-[#059669]">
-          <span className="inline-flex items-center gap-1.5">
-            <ShieldCheck className="w-3.5 h-3.5" strokeWidth={2} />
-            <span>الجلسة محفوظة تلقائياً حتى تسليم السوار</span>
-          </span>
-          <span className="text-[#475569] tabular-nums">
-            النطاق {band.safeLimitM} متر
-          </span>
-        </div>
-
-        {/* One-Tap Sound + Notification + Vibration + GPS Unlock */}
+        {/* One-Tap Sound + Vibration Unlock */}
         {!alertsEnabled ? (
           <button
             type="button"
@@ -349,74 +426,109 @@ export function ParentTab({
               </GlassIcon>
               <span>الإنذار الصوتي والاهتزاز نشط</span>
             </span>
-            <button
-              type="button"
-              onClick={() => setGpsActive((v) => !v)}
-              className="inline-flex items-center gap-1 text-[#0284C7] cursor-pointer"
-            >
-              <LocateFixed className="w-3.5 h-3.5" strokeWidth={2} />
-              <span>{gpsActive ? 'GPS مفعّل' : 'تشغيل GPS'}</span>
-            </button>
+            <span className="inline-flex items-center gap-1 text-[#0284C7] tabular-nums">
+              <BatteryCharging className="w-3.5 h-3.5" strokeWidth={2} />
+              <span>البطارية {band.batteryPct}%</span>
+            </span>
           </div>
         )}
 
-        {/* LIVE INTERACTIVE LEAFLET MAP + TETHER + BREADCRUMB PATH */}
-        <LiveLeafletMap band={band} heightClass="h-[360px] sm:h-[420px]" />
+        {/* INTERACTIVE ARCHITECTURAL SMART MALL MAP */}
+        <SmartMallMap
+          band={band}
+          allowDragChild={false}
+          allowDragParent={Boolean(onDragParent)}
+          onDragParent={
+            onDragParent ? (pt) => onDragParent(band.bandId, pt) : undefined
+          }
+        />
 
-        {/* 4 FROSTED GLASS METRIC CARDS */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-          <div className="glass-card rounded-2xl p-3.5 flex items-center gap-3">
-            <GlassIcon tone={statusTone} size="md">
-              <MapPin className="w-5 h-5" strokeWidth={1.9} />
+        {/* FROSTED GLASS TELEMETRY CARDS + 4-DIGIT RETURN PIN */}
+        <div className="grid grid-cols-2 sm:grid-cols-5 gap-3">
+          <div className="glass-card rounded-2xl p-3 flex items-center gap-2.5">
+            <GlassIcon tone={statusTone} size="sm">
+              <MapPin className="w-4 h-4" strokeWidth={2} />
             </GlassIcon>
             <div className="min-w-0">
-              <p className="text-[11px] font-medium text-[#475569]">المسافة</p>
-              <p className="text-base font-bold text-[#0F172A] tabular-nums">
+              <p className="text-[10px] font-semibold text-[#64748B]">المسافة</p>
+              <p className="text-sm font-bold text-[#0F172A] tabular-nums">
                 {dist.toFixed(1)} م
               </p>
             </div>
           </div>
 
-          <div className="glass-card rounded-2xl p-3.5 flex items-center gap-3">
-            <GlassIcon tone="track" size="md">
-              <Footprints className="w-5 h-5" strokeWidth={1.9} />
+          <div className="glass-card rounded-2xl p-3 flex items-center gap-2.5">
+            <GlassIcon tone="track" size="sm">
+              <Footprints className="w-4 h-4" strokeWidth={2} />
             </GlassIcon>
             <div className="min-w-0">
-              <p className="text-[11px] font-medium text-[#475569]">الخطوات</p>
-              <p className="text-base font-bold text-[#0F172A] tabular-nums">
+              <p className="text-[10px] font-semibold text-[#64748B]">الخطوات</p>
+              <p className="text-sm font-bold text-[#0F172A] tabular-nums">
                 {band.steps}
               </p>
             </div>
           </div>
 
-          <div className="glass-card rounded-2xl p-3.5 flex items-center gap-3">
-            <GlassIcon tone={statusTone} size="md">
-              <Radio className="w-5 h-5" strokeWidth={1.9} />
+          <div className="glass-card rounded-2xl p-3 flex items-center gap-2.5">
+            <GlassIcon
+              tone={band.batteryPct <= 20 ? 'alert' : 'safe'}
+              size="sm"
+            >
+              <BatteryCharging className="w-4 h-4" strokeWidth={2} />
             </GlassIcon>
             <div className="min-w-0">
-              <p className="text-[11px] font-medium text-[#475569]">المنطقة</p>
-              <p className="text-xs font-bold text-[#0F172A] truncate mt-0.5">
-                {zoneInfo.label}
+              <p className="text-[10px] font-semibold text-[#64748B]">البطارية</p>
+              <p className="text-sm font-bold text-[#0F172A] tabular-nums">
+                {band.batteryPct}%
               </p>
             </div>
           </div>
 
-          <div className="glass-card rounded-2xl p-3.5 flex items-center gap-3">
-            <GlassIcon tone="neutral" size="md">
-              <KeyRound className="w-5 h-5" strokeWidth={1.9} />
+          <div className="glass-card rounded-2xl p-3 flex items-center gap-2.5">
+            <GlassIcon tone={isTampered ? 'alert' : 'safe'} size="sm">
+              {isTampered ? (
+                <ShieldAlert className="w-4 h-4" strokeWidth={2} />
+              ) : (
+                <ShieldCheck className="w-4 h-4" strokeWidth={2} />
+              )}
             </GlassIcon>
             <div className="min-w-0">
-              <p className="text-[11px] font-medium text-[#475569]">رمز التسليم</p>
-              <p className="text-base font-bold text-[#0F172A] tabular-nums">
+              <p className="text-[10px] font-semibold text-[#64748B]">القفل</p>
+              <p className="text-[11px] font-bold text-[#0F172A] truncate">
+                {isTampered ? 'محاولة فك' : 'مغلق إلكترونياً'}
+              </p>
+            </div>
+          </div>
+
+          <div className="col-span-2 sm:col-span-1 glass-panel rounded-2xl p-3 flex items-center gap-2.5 border-[#0284C7]/25">
+            <GlassIcon tone="neutral" size="sm">
+              <KeyRound className="w-4 h-4" strokeWidth={2} />
+            </GlassIcon>
+            <div className="min-w-0">
+              <p className="text-[10px] font-semibold text-[#64748B]">
+                رمز التسليم
+              </p>
+              <p className="text-sm font-bold text-[#0F172A] tabular-nums">
                 {band.pinCode}
               </p>
             </div>
           </div>
         </div>
-      </div>
 
-      {/* Subtle Bottom-Corner Admin Exit Lock (PIN: 1234) */}
-      <AdminExitCorner onAuthorizedExit={onAdminExit} />
+        {/* Clean Subtle Footer Button on Scanned Phone (Zero Trap!) */}
+        {isQrScanMode && onOpenMainDashboard && (
+          <div className="pt-4 flex justify-center">
+            <button
+              type="button"
+              onClick={onOpenMainDashboard}
+              className="px-4 py-2 rounded-full bg-white/70 hover:bg-white border border-white text-[11px] font-bold text-[#64748B] hover:text-[#0F172A] inline-flex items-center gap-1.5 shadow-xs transition-all duration-200 cursor-pointer"
+            >
+              <LayoutDashboard className="w-3.5 h-3.5" strokeWidth={2} />
+              <span>فتح اللوحة الرئيسية</span>
+            </button>
+          </div>
+        )}
+      </div>
     </div>
   );
 }

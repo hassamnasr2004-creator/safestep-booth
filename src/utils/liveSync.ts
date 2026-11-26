@@ -1,34 +1,110 @@
 import mqtt, { MqttClient } from 'mqtt';
 import {
+  JuryStoragePayload,
   LiveBandState,
+  ReturnedBandRecord,
   SessionDictionary,
-  StoredDeviceRole,
   SyncStatus,
 } from '../types/safestep';
 import { sanitizeBandState } from '../data/safestepData';
 
-// Dual-broker auto-healing failover list
+// Dual-broker auto-healing failover list (<200ms cross-device live sync)
 const BROKERS = [
   'wss://broker.emqx.io:8084/mqtt',
   'wss://broker.hivemq.com:8884/mqtt',
 ] as const;
 
-const BC_NAME = 'safestep_live_sync_v4';
+const BC_NAME = 'safestep_jury_v4_bc';
 
-export const ACTIVE_SESSIONS_KEY = 'safestep_active_sessions_v1';
-export const MY_ROLE_KEY = 'safestep_my_role_v1';
-export const RETURNED_COUNT_KEY = 'safestep_returned_count_v1';
+export const JURY_STORAGE_KEY = 'safestep_jury_v4';
 
-export const CLIENT_ID = `safestep_${Math.random().toString(36).slice(2, 10)}`;
+// Legacy stuck keys explicitly cleared on startup so no user is EVER trapped
+const LEGACY_KEYS_TO_CLEAR = [
+  'safestep_my_role_v1',
+  'safestep_active_sessions_v1',
+  'safestep_returned_count_v1',
+  'safestep_returned_history_v1',
+];
+
+export const CLIENT_ID = `safestep_v4_${Math.random().toString(36).slice(2, 10)}`;
 
 export function getBandStateTopic(bandId: string): string {
-  return `safestep/live/band/${bandId.trim().toUpperCase()}/state`;
+  return `safestep/jury/v4/band/${bandId.trim().toUpperCase()}/state`;
 }
 
 export type BandUpdateHandler = (state: LiveBandState) => void;
 export type StatusChangeHandler = (status: SyncStatus) => void;
 
-class SafeStepDualBrokerSync {
+export function clearLegacyStuckStorage(): void {
+  if (typeof window === 'undefined') return;
+  try {
+    LEGACY_KEYS_TO_CLEAR.forEach((key) => {
+      window.localStorage.removeItem(key);
+    });
+  } catch {
+    // Ignore storage access errors
+  }
+}
+
+export function loadJuryStorage(): JuryStoragePayload | null {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(JURY_STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<JuryStoragePayload>;
+    if (!parsed || typeof parsed !== 'object') return null;
+
+    const cleanSessions: SessionDictionary = {};
+    if (parsed.sessions && typeof parsed.sessions === 'object') {
+      for (const item of Object.values(parsed.sessions)) {
+        const sanitized = sanitizeBandState(item);
+        if (sanitized && !sanitized.isReturned) {
+          cleanSessions[sanitized.bandId] = sanitized;
+        }
+      }
+    }
+
+    const cleanHistory: Record<string, ReturnedBandRecord> = {};
+    if (parsed.returnedHistory && typeof parsed.returnedHistory === 'object') {
+      for (const [id, rec] of Object.entries(parsed.returnedHistory)) {
+        if (rec && typeof rec.bandId === 'string') {
+          cleanHistory[id.toUpperCase()] = {
+            bandId: rec.bandId.toUpperCase(),
+            childName: typeof rec.childName === 'string' ? rec.childName : 'طفل',
+            returnedAt:
+              typeof rec.returnedAt === 'number' ? rec.returnedAt : Date.now(),
+          };
+        }
+      }
+    }
+
+    const returnedCount =
+      typeof parsed.returnedCount === 'number' &&
+      Number.isFinite(parsed.returnedCount) &&
+      parsed.returnedCount >= 0
+        ? Math.round(parsed.returnedCount)
+        : Object.keys(cleanHistory).length;
+
+    return {
+      sessions: cleanSessions,
+      returnedHistory: cleanHistory,
+      returnedCount,
+    };
+  } catch {
+    return null;
+  }
+}
+
+export function saveJuryStorage(payload: JuryStoragePayload): void {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(JURY_STORAGE_KEY, JSON.stringify(payload));
+  } catch {
+    // Ignore quota errors
+  }
+}
+
+class SafeStepJuryLiveSync {
   private client: MqttClient | null = null;
   private bc: BroadcastChannel | null = null;
   private brokerIndex = 0;
@@ -45,7 +121,7 @@ class SafeStepDualBrokerSync {
     if (this.started || typeof window === 'undefined') return;
     this.started = true;
 
-    // 1. Same-device BroadcastChannel instant sync
+    // 1. Instant same-device BroadcastChannel sync
     if ('BroadcastChannel' in window) {
       try {
         this.bc = new BroadcastChannel(BC_NAME);
@@ -60,13 +136,13 @@ class SafeStepDualBrokerSync {
       }
     }
 
-    // 2. Cross-tab localStorage event sync
+    // 2. Cross-tab localStorage sync
     window.addEventListener('storage', (ev) => {
-      if (ev.key !== ACTIVE_SESSIONS_KEY || !ev.newValue) return;
+      if (ev.key !== JURY_STORAGE_KEY || !ev.newValue) return;
       try {
-        const dict = JSON.parse(ev.newValue) as Record<string, unknown>;
-        if (dict && typeof dict === 'object' && !Array.isArray(dict)) {
-          Object.values(dict).forEach((rawBand) => {
+        const parsed = JSON.parse(ev.newValue) as Partial<JuryStoragePayload>;
+        if (parsed?.sessions && typeof parsed.sessions === 'object') {
+          Object.values(parsed.sessions).forEach((rawBand) => {
             const clean = sanitizeBandState(rawBand);
             if (clean && clean.senderId !== CLIENT_ID) {
               this.emitUpdate(clean);
@@ -78,7 +154,7 @@ class SafeStepDualBrokerSync {
       }
     });
 
-    // 3. Auto-heal on phone screen wake or network restore (<300ms retained pull)
+    // 3. Auto-heal on phone screen wake or reconnect
     document.addEventListener('visibilitychange', () => {
       if (document.visibilityState === 'visible') {
         this.healAndResubscribe();
@@ -89,7 +165,7 @@ class SafeStepDualBrokerSync {
       this.healAndResubscribe();
     });
 
-    // 4. Connect to primary broker (EMQX -> automatic failover to HiveMQ)
+    // 4. Dual-broker MQTT over WebSockets
     this.connectBroker(0);
   }
 
@@ -126,7 +202,6 @@ class SafeStepDualBrokerSync {
       });
       this.client = client;
 
-      // Failover watchdog if primary broker fails to connect within 6s
       this.connectTimeoutWatch = window.setTimeout(() => {
         if (this.client && !this.client.connected) {
           this.failoverNext();
@@ -182,7 +257,6 @@ class SafeStepDualBrokerSync {
     if (!this.client || !this.client.connected) return;
     this.subscribedBands.forEach((bandId) => {
       const topic = getBandStateTopic(bandId);
-      // Unsubscribe + re-subscribe forces immediate delivery of latest retained snapshot on wake
       this.client?.unsubscribe(topic, () => {
         this.client?.subscribe(topic, { qos: 1 });
       });
@@ -196,7 +270,6 @@ class SafeStepDualBrokerSync {
     }
     if (this.client.connected) {
       this.resubscribeAll();
-      // Also flush any locally buffered band states
       this.lastPublishedState.forEach((state, bandId) => {
         if (!state.isReturned) {
           this.client?.publish(getBandStateTopic(bandId), JSON.stringify(state), {
@@ -284,7 +357,7 @@ class SafeStepDualBrokerSync {
     }
   }
 
-  public publishReturnAndClearRetained(state: LiveBandState): void {
+  public publishReturnState(state: LiveBandState): void {
     const clean = state.bandId.trim().toUpperCase();
     const topic = getBandStateTopic(clean);
     const now = Date.now();
@@ -292,8 +365,10 @@ class SafeStepDualBrokerSync {
       ...state,
       bandId: clean,
       isReturned: true,
+      returnedAt: now,
       lockStatus: 'unlocked',
       activeAlert: null,
+      recoveryNotice: null,
       lastUpdated: now,
       eventId: Math.max(now, (state.eventId ?? 0) + 1),
       senderId: CLIENT_ID,
@@ -305,13 +380,8 @@ class SafeStepDualBrokerSync {
       try {
         this.client.publish(topic, JSON.stringify(returnedPayload), {
           qos: 1,
-          retain: false,
+          retain: true,
         });
-        window.setTimeout(() => {
-          if (this.client && this.client.connected) {
-            this.client.publish(topic, '', { qos: 1, retain: true });
-          }
-        }, 280);
       } catch {
         // Ignore
       }
@@ -327,88 +397,4 @@ class SafeStepDualBrokerSync {
   }
 }
 
-export const liveSync = new SafeStepDualBrokerSync();
-
-// Bulletproof localStorage helpers
-export function hasStoredSessionsKey(): boolean {
-  try {
-    return window.localStorage.getItem(ACTIVE_SESSIONS_KEY) !== null;
-  } catch {
-    return false;
-  }
-}
-
-export function loadActiveSessions(): SessionDictionary {
-  try {
-    const raw = window.localStorage.getItem(ACTIVE_SESSIONS_KEY);
-    if (!raw) return {};
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
-    const clean: SessionDictionary = {};
-    for (const session of Object.values(parsed)) {
-      const sanitized = sanitizeBandState(session);
-      if (sanitized && !sanitized.isReturned) {
-        clean[sanitized.bandId] = sanitized;
-      }
-    }
-    return clean;
-  } catch {
-    return {};
-  }
-}
-
-export function saveActiveSessions(dict: SessionDictionary): void {
-  try {
-    window.localStorage.setItem(ACTIVE_SESSIONS_KEY, JSON.stringify(dict));
-  } catch {
-    // Ignore
-  }
-}
-
-export function loadMyRole(): StoredDeviceRole | null {
-  try {
-    const raw = window.localStorage.getItem(MY_ROLE_KEY);
-    if (!raw) return null;
-    const parsed = JSON.parse(raw) as Partial<StoredDeviceRole>;
-    if (
-      parsed &&
-      (parsed.role === 'parent' ||
-        parsed.role === 'band' ||
-        parsed.role === 'booth')
-    ) {
-      return {
-        role: parsed.role,
-        activeBandId: typeof parsed.activeBandId === 'string' ? parsed.activeBandId : '',
-      };
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-export function saveMyRole(role: StoredDeviceRole): void {
-  try {
-    window.localStorage.setItem(MY_ROLE_KEY, JSON.stringify(role));
-  } catch {
-    // Ignore
-  }
-}
-
-export function loadReturnedCount(): number {
-  try {
-    const raw = window.localStorage.getItem(RETURNED_COUNT_KEY);
-    const n = raw ? parseInt(raw, 10) : 0;
-    return Number.isNaN(n) ? 0 : n;
-  } catch {
-    return 0;
-  }
-}
-
-export function saveReturnedCount(count: number): void {
-  try {
-    window.localStorage.setItem(RETURNED_COUNT_KEY, String(count));
-  } catch {
-    // Ignore
-  }
-}
+export const liveSync = new SafeStepJuryLiveSync();
