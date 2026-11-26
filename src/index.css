@@ -1,0 +1,82 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --surface-canvas: #F8FAFC;
+    --surface-card: #FFFFFF;
+    --border-hairline: #E2E8F0;
+    --ink-primary: #0F172A;
+    --ink-muted: #475569;
+    --accent-navy: #1E3A8A;
+    --semantic-safe: #0D9488;
+    --semantic-warn: #D97706;
+    --semantic-alert: #DC2626;
+  }
+
+  html {
+    font-family: 'Alexandria', system-ui, -apple-system, sans-serif;
+    direction: rtl;
+    scroll-behavior: smooth;
+  }
+
+  body {
+    background-color: var(--surface-canvas);
+    color: var(--ink-primary);
+    font-feature-settings: "kern" 1;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Precision crop mark styling for QR Print Studio */
+.crop-mark-card {
+  position: relative;
+  break-inside: avoid;
+  page-break-inside: avoid;
+}
+
+/* Strict Print Media Isolation for A4 QR Label Studio */
+@media print {
+  @page {
+    size: A4 portrait;
+    margin: 10mm;
+  }
+
+  html,
+  body {
+    background: #FFFFFF !important;
+    color: #000000 !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    -webkit-print-color-adjust: exact !important;
+    print-color-adjust: exact !important;
+  }
+
+  .no-print {
+    display: none !important;
+  }
+
+  .print-only-container {
+    display: block !important;
+    width: 100% !important;
+    max-width: none !important;
+    margin: 0 !important;
+    padding: 0 !important;
+    border: none !important;
+    box-shadow: none !important;
+    background: #FFFFFF !important;
+  }
+
+  .print-sheet-grid {
+    display: grid !important;
+    gap: 6mm !important;
+  }
+
+  .print-card-item {
+    break-inside: avoid !important;
+    page-break-inside: avoid !important;
+    box-shadow: none !important;
+  }
+}
